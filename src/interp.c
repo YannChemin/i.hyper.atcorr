@@ -1,0 +1,126 @@
+/* Spectral interpolation — ported from 6SV2.1 INTERP.f
+ * Interpolates ctx->disc quantities from 20 reference wavelengths
+ * to any specific wavelength using log-log interpolation. */
+#include "../include/sixs_ctx.h"
+#include <math.h>
+#include <string.h>
+
+/* Log-log interpolation: y = beta * wl^alpha.
+ * Requires y_inf > 0, y_sup > 0.
+ * Falls back to linear if either is non-positive. */
+static float log_interp(float y_inf, float y_sup,
+                          float wl_inf, float coef, float wl)
+{
+    if (y_inf <= 1e-30f || y_sup <= 1e-30f) {
+        /* Linear fallback */
+        float t = logf(wl / wl_inf) / coef;
+        return y_inf + t * (y_sup - y_inf);
+    }
+    float alpha = logf(y_sup / y_inf) / coef;
+    float beta  = y_inf / powf(wl_inf, alpha);
+    return beta * powf(wl, alpha);
+}
+
+/* ------------------------------------------------------------------ *
+ * sixs_interp: interpolate pre-computed 20-wavelength disc quantities
+ * to a specific wavelength wl (µm).
+ *
+ *   ctx      - context with disc, aer filled by sixs_discom()
+ *   iaer     - aerosol model (0 = no aerosol)
+ *   wl       - target wavelength (µm)
+ *   taer55   - aerosol optical depth at 550nm
+ *   taer55p  - taer55 above sensor plane
+ *
+ * Outputs (all at wavelength wl):
+ *   roatm    - atmospheric path reflectance (Rayleigh + aerosol)
+ *   T_down   - total downward transmittance (direct + diffuse)
+ *   T_up     - total upward transmittance (direct + diffuse)
+ *   s_alb    - spherical albedo
+ *   tray_out - Rayleigh optical depth (optional, may be NULL)
+ *   taer_out - aerosol optical depth (optional, may be NULL)
+ * ------------------------------------------------------------------ */
+void sixs_interp(const SixsCtx *ctx, int iaer, float wl,
+                  float taer55, float taer55p,
+                  float *roatm, float *T_down, float *T_up, float *s_alb,
+                  float *tray_out, float *taer_out)
+{
+    const SixsDisc *d = &ctx->disc;
+
+    /* Defaults */
+    *roatm = 0.0f; *T_down = 1.0f; *T_up = 1.0f; *s_alb = 0.0f;
+    if (tray_out) *tray_out = 0.0f;
+    if (taer_out) *taer_out = 0.0f;
+
+    /* Find bracketing wavelength indices (0-based) */
+    int linf = 0;
+    for (int ll = 0; ll < NWL_DISC - 1; ll++) {
+        if (wl > d->wldis[ll] && wl <= d->wldis[ll+1]) { linf = ll; break; }
+    }
+    if (wl > d->wldis[NWL_DISC - 1]) linf = NWL_DISC - 2;
+    int lsup = linf + 1;
+
+    float wl_inf = d->wldis[linf];
+    float wl_sup = d->wldis[lsup];
+    float coef   = logf(wl_sup / wl_inf);   /* log(wl ratio) */
+
+    /* ---- Atmospheric reflectance: romix = roatm[1] ---- */
+    float roatm_inf = d->roatm[1][linf];
+    float roatm_sup = d->roatm[1][lsup];
+    *roatm = log_interp(roatm_inf, roatm_sup, wl_inf, coef, wl);
+
+    /* ---- Rayleigh optical depth ---- */
+    float tray = log_interp(d->trayl[linf], d->trayl[lsup], wl_inf, coef, wl);
+    if (tray_out) *tray_out = tray;
+
+    /* ---- Aerosol optical depth ---- */
+    float taer = 0.0f;
+    if (iaer != 0 && ctx->aer.ext[7] > 0.0f) {
+        float ext_inf = ctx->aer.ext[linf], ext_sup = ctx->aer.ext[lsup];
+        float alpha = logf(ext_sup / ext_inf) / coef;
+        float beta  = ext_inf / powf(wl_inf, alpha);
+        float ext_wl = beta * powf(wl, alpha);
+        taer = taer55 * ext_wl / ctx->aer.ext[7];
+        if (taer_out) *taer_out = taer;
+    }
+
+    /* ---- Downward transmittance: dtott = dtotc * dtotr ---- */
+    /* dtotr = Rayleigh (dir + dif), dtotr at wl */
+    float drinf = d->dtdif[0][linf] + d->dtdir[0][linf];
+    float drsup = d->dtdif[0][lsup] + d->dtdir[0][lsup];
+    float dtotr = log_interp(drinf, drsup, wl_inf, coef, wl);
+
+    /* dtotc = ratio total / Rayleigh, interpolated */
+    float dtinf = d->dtdif[1][linf] + d->dtdir[1][linf];
+    float dtsup = d->dtdif[1][lsup] + d->dtdir[1][lsup];
+    float dtotc;
+    if (drinf > 1e-10f && drsup > 1e-10f) {
+        float alpha = logf((dtsup * drinf) / (dtinf * drsup)) / coef;
+        float beta  = (dtinf / drinf) / powf(wl_inf, alpha);
+        dtotc = beta * powf(wl, alpha);
+    } else {
+        dtotc = (drinf > 0.0f) ? dtinf / drinf : 1.0f;
+    }
+    *T_down = dtotc * dtotr;
+
+    /* ---- Upward transmittance: utott = utotc * utotr ---- */
+    float urinf = d->utdif[0][linf] + d->utdir[0][linf];
+    float ursup = d->utdif[0][lsup] + d->utdir[0][lsup];
+    float utotr = log_interp(urinf, ursup, wl_inf, coef, wl);
+
+    float utinf = d->utdif[1][linf] + d->utdir[1][linf];
+    float utsup = d->utdif[1][lsup] + d->utdir[1][lsup];
+    float utotc;
+    if (urinf > 1e-10f && ursup > 1e-10f) {
+        float alpha = logf((utsup * urinf) / (utinf * ursup)) / coef;
+        float beta  = (utinf / urinf) / powf(wl_inf, alpha);
+        utotc = beta * powf(wl, alpha);
+    } else {
+        utotc = (urinf > 0.0f) ? utinf / urinf : 1.0f;
+    }
+    *T_up = utotc * utotr;
+
+    /* ---- Spherical albedo: astot ---- */
+    *s_alb = log_interp(d->sphal[1][linf], d->sphal[1][lsup], wl_inf, coef, wl);
+
+    (void)taer55p;  /* used by 6SV for taerp; not needed for our inversion */
+}

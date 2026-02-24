@@ -1,0 +1,10 @@
+build/
+OBJ.*/
+*.o
+*.so
+*.lut
+tests/test_basic
+*.tmp.html
+*.tmp.md
+__pycache__/
+*.pyc
