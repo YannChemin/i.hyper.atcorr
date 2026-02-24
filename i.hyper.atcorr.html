@@ -1,0 +1,233 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<title>GRASS GIS manual: i.hyper.atcorr</title>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+<link rel="stylesheet" href="grassdocs.css" type="text/css">
+</head>
+<body bgcolor="white">
+<div id="container">
+
+<a href="index.html"><img src="grass_logo.png" alt="GRASS logo"></a>
+<hr class="header">
+
+<h2>NAME</h2>
+<em><b>i.hyper.atcorr</b></em> - Computes an atmospheric correction look-up table (LUT)
+using the 6SV2.1 radiative transfer algorithm.
+
+<h2>KEYWORDS</h2>
+<a href="imagery.html">imagery</a>,
+<a href="topic_atmospheric_correction.html">atmospheric correction</a>,
+<a href="topic_radiative_transfer.html">radiative transfer</a>,
+6SV, hyperspectral, LUT
+
+<h2>SYNOPSIS</h2>
+<div id="name"><b>i.hyper.atcorr</b><br></div>
+<b>i.hyper.atcorr --help</b><br>
+<div id="synopsis"><b>i.hyper.atcorr</b>
+<b>output</b>=<em>name</em>
+<b>sza</b>=<em>float</em>
+[<b>vza</b>=<em>float</em>]
+[<b>raa</b>=<em>float</em>]
+[<b>altitude</b>=<em>float</em>]
+[<b>atmosphere</b>=<em>string</em>]
+[<b>aerosol</b>=<em>string</em>]
+[<b>ozone</b>=<em>float</em>]
+[<b>aod</b>=<em>values</em>]
+[<b>h2o</b>=<em>values</em>]
+[<b>wl_min</b>=<em>float</em>]
+[<b>wl_max</b>=<em>float</em>]
+[<b>wl_step</b>=<em>float</em>]
+[--<b>verbose</b>]
+[--<b>help</b>]
+</div>
+
+<h3>Flags:</h3>
+<dl>
+<dt><b>--verbose</b></dt>
+<dd>Print summary statistics after LUT computation</dd>
+<dt><b>--help</b></dt>
+<dd>Print usage summary</dd>
+</dl>
+
+<h3>Parameters:</h3>
+<dl>
+<dt><b>output</b>=<em>name</em> <b>[required]</b></dt>
+<dd>Output LUT binary file (conventionally <tt>.lut</tt>)</dd>
+
+<dt><b>sza</b>=<em>float</em> <b>[required]</b></dt>
+<dd>Solar zenith angle in degrees (0 to &lt;90)</dd>
+
+<dt><b>vza</b>=<em>float</em></dt>
+<dd>Sensor view zenith angle in degrees (0&ndash;60); default: <tt>0</tt></dd>
+
+<dt><b>raa</b>=<em>float</em></dt>
+<dd>Relative azimuth angle between sun and sensor in degrees; default: <tt>0</tt></dd>
+
+<dt><b>altitude</b>=<em>float</em></dt>
+<dd>Sensor altitude in km; values &gt;900 are treated as satellite; default: <tt>1000</tt></dd>
+
+<dt><b>atmosphere</b>=<em>string</em></dt>
+<dd>Standard atmosphere model; options: <tt>us62</tt>, <tt>midsum</tt>,
+<tt>midwin</tt>, <tt>tropical</tt>, <tt>subsum</tt>, <tt>subwin</tt>;
+default: <tt>us62</tt></dd>
+
+<dt><b>aerosol</b>=<em>string</em></dt>
+<dd>Aerosol type; options: <tt>none</tt>, <tt>continental</tt>,
+<tt>maritime</tt>, <tt>urban</tt>, <tt>desert</tt>;
+default: <tt>continental</tt></dd>
+
+<dt><b>ozone</b>=<em>float</em></dt>
+<dd>Total ozone column in Dobson units; default: <tt>300</tt></dd>
+
+<dt><b>aod</b>=<em>values</em></dt>
+<dd>Comma-separated AOD at 550&nbsp;nm values for the LUT grid;
+default: <tt>0.0,0.05,0.1,0.2,0.4,0.8</tt></dd>
+
+<dt><b>h2o</b>=<em>values</em></dt>
+<dd>Comma-separated column water vapour values (g/cm&sup2;) for the LUT grid;
+default: <tt>0.5,1.0,2.0,3.5,5.0</tt></dd>
+
+<dt><b>wl_min</b>=<em>float</em></dt>
+<dd>Minimum wavelength in micrometres; default: <tt>0.40</tt></dd>
+
+<dt><b>wl_max</b>=<em>float</em></dt>
+<dd>Maximum wavelength in micrometres; default: <tt>2.50</tt></dd>
+
+<dt><b>wl_step</b>=<em>float</em></dt>
+<dd>Wavelength step in micrometres; default: <tt>0.01</tt></dd>
+</dl>
+
+<h2>DESCRIPTION</h2>
+
+<em>i.hyper.atcorr</em> computes a multi-dimensional atmospheric correction
+look-up table (LUT) using a C port of the 6SV2.1 (Second Simulation of a
+Satellite Signal in the Solar Spectrum, version 2.1) radiative transfer
+code with OpenMP parallelisation over the AOD dimension.
+
+<p>
+The LUT spans a grid of AOD (aerosol optical depth at 550&nbsp;nm) and
+column water vapour (H<sub>2</sub>O) values at a set of user-specified
+wavelengths. For each grid point the module stores four atmospheric
+parameters:
+</p>
+<ul>
+  <li><b>R_atm</b> &mdash; atmospheric path reflectance</li>
+  <li><b>T_down</b> &mdash; total downward transmittance (direct + diffuse)</li>
+  <li><b>T_up</b> &mdash; total upward transmittance (direct + diffuse)</li>
+  <li><b>s_alb</b> &mdash; spherical albedo of the atmosphere</li>
+</ul>
+
+<p>
+These four parameters are sufficient to invert a top-of-atmosphere (TOA)
+reflectance image to surface (BOA) reflectance via the standard
+algebraic formula:
+</p>
+<pre>
+  rho_boa = (rho_toa - R_atm) / (T_down * T_up * (1 + s_alb * rho_boa))
+</pre>
+
+<p>
+The output is a compact binary LUT file intended for use by
+<em>i.hyper.smac</em>, which loads it via the <tt>atcorr.py</tt>
+Python ctypes bindings bundled with the add-on.
+</p>
+
+<h2>NOTES</h2>
+
+<h3>LUT file format</h3>
+<p>
+The binary file is host-endian (little-endian on x86) and has the
+following layout:
+</p>
+<pre>
+  magic     uint32   0x4C555400 ("LUT\0")
+  version   uint32   1
+  n_aod     int32
+  n_h2o     int32
+  n_wl      int32
+  aod[n_aod]          float32
+  h2o[n_h2o]          float32
+  wl [n_wl]           float32   (micrometres)
+  R_atm [n_aod*n_h2o*n_wl]   float32
+  T_down[n_aod*n_h2o*n_wl]   float32
+  T_up  [n_aod*n_h2o*n_wl]   float32
+  s_alb [n_aod*n_h2o*n_wl]   float32
+</pre>
+<p>Array indexing is C order: the wavelength index varies fastest.</p>
+
+<h3>Radiative transfer</h3>
+<p>
+The RT solver is a direct C port of the 6SV2.1 Fortran code (Vermote
+et&nbsp;al. 1997). Scattering is computed via the Successive Orders of
+Scattering (SOS) method with Gauss&ndash;Legendre quadrature (25 points
+per hemisphere, 30 atmospheric layers). Gas absorption (H<sub>2</sub>O,
+O<sub>3</sub>, CO<sub>2</sub>, O<sub>2</sub>, N<sub>2</sub>O, CH<sub>4</sub>)
+is computed separately and folded into T_down and T_up so that the
+scattering LUT only needs to be computed once per AOD value.
+</p>
+
+<h3>OpenMP parallelism</h3>
+<p>
+Each AOD grid point is independent and is computed in a separate OpenMP
+thread. On a 4-core machine a 6&nbsp;AOD&nbsp;&times;&nbsp;5&nbsp;H<sub>2</sub>O&nbsp;&times;&nbsp;211&nbsp;band
+LUT takes approximately one second.
+</p>
+
+<h2>EXAMPLES</h2>
+
+<h3>Generate a LUT for a Tanager scene over Kanpur</h3>
+<pre>
+i.hyper.atcorr \
+    output=kanpur_lut.lut \
+    sza=35.2 vza=4.1 raa=97 \
+    atmosphere=midsum aerosol=continental ozone=310 \
+    aod=0.0,0.05,0.1,0.2,0.4,0.8 \
+    h2o=1.0,2.0,3.5,5.0 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005
+</pre>
+
+<h3>Quick test at coarse spectral resolution</h3>
+<pre>
+i.hyper.atcorr --verbose \
+    output=/tmp/test.lut \
+    sza=30 vza=0 raa=0 \
+    aod=0.0,0.2,0.4 h2o=2.0,4.0 \
+    wl_min=0.4 wl_max=2.5 wl_step=0.05
+</pre>
+
+<h2>SEE ALSO</h2>
+<em>
+<a href="i.hyper.smac.html">i.hyper.smac</a>,
+<a href="i.atcorr.html">i.atcorr</a>
+</em>
+
+<h2>REFERENCES</h2>
+<ul>
+<li>Vermote, E.F., Tanr&eacute;, D., Deuz&eacute;, J.L., Herman, M. and Morcrette,
+J.J. (1997): Second simulation of the satellite signal in the solar spectrum,
+6S: An overview. <em>IEEE Transactions on Geoscience and Remote Sensing</em>,
+35(3), 675&ndash;686.</li>
+<li>Kotchenova, S.Y., Vermote, E.F., Matarrese, R. and Klemm, F.J. (2006):
+Validation of a vector version of the 6S radiative transfer code for
+atmospheric correction of satellite data. <em>Applied Optics</em>,
+45(26), 6762&ndash;6778.</li>
+</ul>
+
+<h2>AUTHORS</h2>
+i.hyper.smac project.
+
+<hr class="footer">
+<p>
+<a href="index.html">Main index</a> |
+<a href="imagery.html">Imagery index</a> |
+<a href="topics.html">Topics index</a> |
+<a href="keywords.html">Keywords index</a> |
+<a href="graphical_index.html">Graphical index</a> |
+<a href="full_index.html">Full index</a>
+</p>
+<p>&copy; 2003-2025 <a href="http://grass.osgeo.org">GRASS Development Team</a>,
+GRASS GIS 8.5.0dev Reference Manual</p>
+</div>
+</body>
+</html>
