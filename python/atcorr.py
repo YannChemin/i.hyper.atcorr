@@ -1,7 +1,7 @@
 """Python ctypes bindings for libatcorr.so (6SV2.1-based atmospheric correction).
 
 Usage:
-    from atcorr import LutConfig, LutArrays, compute_lut, invert
+    from atcorr import LutConfig, LutArrays, compute_lut, lut_slice, invert, solar_E0, earth_sun_dist2
 
     cfg = LutConfig(
         wl=np.array([0.45, 0.55, 0.65, 0.85], dtype=np.float32),
@@ -85,9 +85,47 @@ _lib.atcorr_compute_lut.restype = ctypes.c_int
 _lib.atcorr_version.argtypes = []
 _lib.atcorr_version.restype  = ctypes.c_char_p
 
+_lib.sixs_E0.argtypes = [ctypes.c_float]
+_lib.sixs_E0.restype  = ctypes.c_float
+
+_lib.sixs_earth_sun_dist2.argtypes = [ctypes.c_int]
+_lib.sixs_earth_sun_dist2.restype  = ctypes.c_double
+
+_lib.atcorr_lut_slice.argtypes = [
+    ctypes.POINTER(_LutConfigC),
+    ctypes.POINTER(_LutArraysC),
+    ctypes.c_float,                          # aod_val
+    ctypes.c_float,                          # h2o_val
+    ctypes.POINTER(ctypes.c_float),          # Rs  [n_wl]
+    ctypes.POINTER(ctypes.c_float),          # Tds [n_wl]
+    ctypes.POINTER(ctypes.c_float),          # Tus [n_wl]
+    ctypes.POINTER(ctypes.c_float),          # ss  [n_wl]
+]
+_lib.atcorr_lut_slice.restype = None
+
 
 def version() -> str:
     return _lib.atcorr_version().decode()
+
+
+def solar_E0(wl_um):
+    """Solar irradiance E0 in W/(m² µm) from 6SV2.1 Thuillier spectrum.
+
+    Parameters
+    ----------
+    wl_um : float or array-like
+        Wavelength in µm.
+    """
+    wl_arr = np.asarray(wl_um, dtype=np.float32)
+    scalar = wl_arr.ndim == 0
+    wl_arr = np.atleast_1d(wl_arr)
+    out = np.array([_lib.sixs_E0(float(w)) for w in wl_arr], dtype=np.float32)
+    return float(out[0]) if scalar else out
+
+
+def earth_sun_dist2(doy):
+    """Squared Earth-Sun distance d² in AU for day-of-year (1–365)."""
+    return _lib.sixs_earth_sun_dist2(int(doy))
 
 
 # ── Public Python API ─────────────────────────────────────────────────────────
@@ -186,6 +224,57 @@ def compute_lut(cfg: LutConfig) -> LutArrays:
         T_up   = T_up.reshape(shape),
         s_alb  = s_alb.reshape(shape),
     )
+
+
+def lut_slice(cfg: LutConfig, arrays: LutArrays,
+              aod_val: float, h2o_val: float) -> LutArrays:
+    """Bilinear interpolation of the LUT at a fixed (aod_val, h2o_val).
+
+    Returns a LutArrays object whose four arrays are 1-D [n_wl] spectral
+    curves at the requested atmospheric state.  Useful for pre-computing
+    scene-average correction parameters before pixel-level inversion.
+    """
+    n_wl = len(cfg.wl)
+    Rs   = np.zeros(n_wl, dtype=np.float32)
+    Tds  = np.zeros(n_wl, dtype=np.float32)
+    Tus  = np.zeros(n_wl, dtype=np.float32)
+    ss   = np.zeros(n_wl, dtype=np.float32)
+
+    n_aod = len(cfg.aod)
+    n_h2o = len(cfg.h2o)
+    n     = n_aod * n_h2o * n_wl
+
+    # Flatten LutArrays to 1-D for the C call
+    Ra  = arrays.R_atm.ravel().astype(np.float32)
+    Td  = arrays.T_down.ravel().astype(np.float32)
+    Tu  = arrays.T_up.ravel().astype(np.float32)
+    sa  = arrays.s_alb.ravel().astype(np.float32)
+    assert len(Ra) == n
+
+    c_cfg = _LutConfigC(
+        wl=cfg.wl.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_wl=n_wl,
+        aod=cfg.aod.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_aod=n_aod,
+        h2o=cfg.h2o.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_h2o=n_h2o,
+        sza=cfg.sza, vza=cfg.vza, raa=cfg.raa,
+        altitude_km=cfg.altitude_km,
+        atmo_model=cfg.atmo_model, aerosol_model=cfg.aerosol_model,
+        surface_pressure=cfg.surface_pressure, ozone_du=cfg.ozone_du,
+    )
+    c_arr = _LutArraysC(
+        R_atm =Ra.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_down=Td.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_up  =Tu.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        s_alb =sa.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    _lib.atcorr_lut_slice(
+        ctypes.byref(c_cfg), ctypes.byref(c_arr),
+        ctypes.c_float(aod_val), ctypes.c_float(h2o_val),
+        Rs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        Tds.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        Tus.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ss.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return LutArrays(Rs, Tds, Tus, ss)
 
 
 def invert(rho_toa, R_atm, T_down, T_up, s_alb):

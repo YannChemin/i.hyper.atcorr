@@ -87,6 +87,27 @@ static inline float atcorr_invert(float rho_toa, float R_atm,
     return y / (1.0f + s_alb * y + 1e-10f);
 }
 
+/* ─── Solar irradiance and Earth-Sun distance ─────────────────────────────── */
+
+/* Solar irradiance E0 in W/(m² µm) at wl_um, from 6SV2.1 Thuillier spectrum.
+ * Linearly interpolated; clamped at 0.25–4.0 µm. */
+float sixs_E0(float wl_um);
+
+/* Squared Earth-Sun distance d² in AU for day-of-year doy (1–365).
+ * d = 1 − 0.01670963 × cos(2π(doy−3)/365). */
+double sixs_earth_sun_dist2(int doy);
+
+/* ─── LUT spectral slice ──────────────────────────────────────────────────── */
+
+/* Fill per-wavelength correction arrays [n_wl] by bilinear interpolation of
+ * the LUT at a fixed (aod_val, h2o_val) point.  Useful for pre-computing
+ * scene-average atmospheric parameters before pixel-level inversion.
+ *
+ * Rs, Tds, Tus, ss must be pre-allocated with cfg->n_wl floats each. */
+void atcorr_lut_slice(const LutConfig *cfg, const LutArrays *lut,
+                      float aod_val, float h2o_val,
+                      float *Rs, float *Tds, float *Tus, float *ss);
+
 /* ─── Version info ────────────────────────────────────────────────────────── */
 const char *atcorr_version(void);
 

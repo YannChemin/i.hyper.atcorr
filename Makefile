@@ -14,7 +14,7 @@ EXTRA_INC     = -Iinclude -Isrc
 EXTRA_CFLAGS  = -O3 -march=native -ffast-math -fopenmp -std=c11 -fPIC \
                 -Wall -Wextra -Wno-unused-parameter
 EXTRA_LDFLAGS = -fopenmp
-LIBES         = $(GISLIB)
+LIBES         = $(RASTER3DLIB) $(RASTERLIB) $(GISLIB)
 
 include $(MODULE_TOPDIR)/include/Make/Module.make
 
