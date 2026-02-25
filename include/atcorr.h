@@ -108,6 +108,47 @@ void atcorr_lut_slice(const LutConfig *cfg, const LutArrays *lut,
                       float aod_val, float h2o_val,
                       float *Rs, float *Tds, float *Tus, float *ss);
 
+/* ─── SRF convolution correction ─────────────────────────────────────────── */
+
+/* Configuration for per-band Gaussian SRF gas-transmittance correction.
+ * Used by atcorr_srf_compute() to build a correction table that replaces the
+ * coarse 6SV Curtis-Godson gas parameterisation with libRadtran reptran fine
+ * (~0.05 nm) gas transmittance convolved with the sensor SRF. */
+typedef struct {
+    /* Per-band FWHM in µm [n_wl], aligned with LutConfig.wl[].
+     * NULL → treat all bands as sub-threshold (correct everything). */
+    const float *fwhm_um;
+
+    /* Only correct bands where fwhm_um[i] < threshold_um.
+     * 0 or negative → use default of 0.005 µm (5 nm). */
+    float threshold_um;
+} SrfConfig;
+
+/* Opaque correction table returned by atcorr_srf_compute(). */
+typedef struct SrfCorrection_ SrfCorrection;
+
+/* Compute per-band, per-H2O correction factors from libRadtran reptran fine.
+ *
+ * Runs 4 × n_h2o uvspec subprocesses (fine/coarse × down/up × each H2O)
+ * parallelised with OpenMP.  libRadtran must be installed; the uvspec binary
+ * is located via PATH, $LIBRADTRAN_DIR/bin, or $GISBASE/bin.  Data files
+ * are found via $LIBRADTRAN_DATA or standard paths.
+ *
+ * Returns NULL if uvspec is not found or no bands fall below threshold_um. */
+SrfCorrection *atcorr_srf_compute(const SrfConfig   *srf_cfg,
+                                   const LutConfig   *lut_cfg);
+
+/* Apply the correction table to a LUT in place.
+ * Must be called after atcorr_compute_lut() and before pixel inversion.
+ * Multiplies T_down[ia,ih,iw] and T_up[ia,ih,iw] by the H2O-matched
+ * correction factors for each wavelength band. */
+void atcorr_srf_apply(const SrfCorrection *srf,
+                       const LutConfig     *cfg,
+                       LutArrays           *lut);
+
+/* Release memory allocated by atcorr_srf_compute(). */
+void atcorr_srf_free(SrfCorrection *srf);
+
 /* ─── Version info ────────────────────────────────────────────────────────── */
 const char *atcorr_version(void);
 

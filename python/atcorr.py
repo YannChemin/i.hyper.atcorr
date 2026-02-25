@@ -284,3 +284,113 @@ def invert(rho_toa, R_atm, T_down, T_up, s_alb):
     """
     y = (rho_toa - R_atm) / (T_down * T_up + 1e-10)
     return y / (1.0 + s_alb * y + 1e-10)
+
+
+# ── SRF correction API ────────────────────────────────────────────────────────
+
+class _SrfConfigC(ctypes.Structure):
+    _fields_ = [
+        ("fwhm_um",      ctypes.POINTER(ctypes.c_float)),
+        ("threshold_um", ctypes.c_float),
+    ]
+
+
+_lib.atcorr_srf_compute.argtypes = [
+    ctypes.POINTER(_SrfConfigC),
+    ctypes.POINTER(_LutConfigC),
+]
+_lib.atcorr_srf_compute.restype = ctypes.c_void_p   # opaque SrfCorrection*
+
+_lib.atcorr_srf_apply.argtypes = [
+    ctypes.c_void_p,                    # SrfCorrection*
+    ctypes.POINTER(_LutConfigC),
+    ctypes.POINTER(_LutArraysC),
+]
+_lib.atcorr_srf_apply.restype = None
+
+_lib.atcorr_srf_free.argtypes = [ctypes.c_void_p]
+_lib.atcorr_srf_free.restype  = None
+
+
+def apply_srf_correction(cfg: LutConfig, arrays: LutArrays,
+                          fwhm_um, threshold_nm: float = 5.0) -> LutArrays:
+    """Apply per-band Gaussian SRF gas-transmittance correction.
+
+    Replaces the coarse 6SV gas parameterisation (10 cm⁻¹) with libRadtran
+    reptran fine (~0.05 nm) convolved with a Gaussian SRF for bands where
+    FWHM < threshold_nm.  T_down and T_up are modified in the arrays.
+
+    Parameters
+    ----------
+    cfg           : LutConfig used to compute `arrays`.
+    arrays        : LutArrays to correct in place (T_down, T_up modified).
+    fwhm_um       : per-band FWHM in µm, 1-D array aligned with cfg.wl.
+                    Pass None or zeros to correct all bands (delta-SRF).
+    threshold_nm  : only correct bands with FWHM < threshold_nm (default 5).
+
+    Returns
+    -------
+    arrays : same LutArrays with corrected T_down, T_up (modified in place).
+
+    Notes
+    -----
+    Requires libRadtran (uvspec) in PATH or $LIBRADTRAN_DIR/bin.
+    libRadtran data directory must be accessible via $LIBRADTRAN_DATA or the
+    standard installation path /usr/local/share/libRadtran/data.
+    """
+    n_wl  = len(cfg.wl)
+    n_aod = len(cfg.aod)
+    n_h2o = len(cfg.h2o)
+    n     = n_aod * n_h2o * n_wl
+
+    fwhm_arr = (np.asarray(fwhm_um, dtype=np.float32)
+                if fwhm_um is not None
+                else np.zeros(n_wl, dtype=np.float32))
+    if len(fwhm_arr) != n_wl:
+        raise ValueError(f"fwhm_um length {len(fwhm_arr)} != n_wl {n_wl}")
+
+    c_srf_cfg = _SrfConfigC(
+        fwhm_um      = fwhm_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        threshold_um = float(threshold_nm) * 1e-3,   # nm → µm
+    )
+    c_cfg = _LutConfigC(
+        wl=cfg.wl.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_wl=n_wl,
+        aod=cfg.aod.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_aod=n_aod,
+        h2o=cfg.h2o.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_h2o=n_h2o,
+        sza=cfg.sza, vza=cfg.vza, raa=cfg.raa,
+        altitude_km=cfg.altitude_km,
+        atmo_model=cfg.atmo_model, aerosol_model=cfg.aerosol_model,
+        surface_pressure=cfg.surface_pressure, ozone_du=cfg.ozone_du,
+    )
+
+    # Flatten LutArrays to 1-D C arrays
+    Td = np.ascontiguousarray(arrays.T_down.ravel(), dtype=np.float32)
+    Tu = np.ascontiguousarray(arrays.T_up.ravel(),   dtype=np.float32)
+    Ra = np.ascontiguousarray(arrays.R_atm.ravel(),  dtype=np.float32)
+    sa = np.ascontiguousarray(arrays.s_alb.ravel(),  dtype=np.float32)
+    assert len(Td) == n
+
+    c_arr = _LutArraysC(
+        R_atm =Ra.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_down=Td.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_up  =Tu.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        s_alb =sa.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+
+    srf = _lib.atcorr_srf_compute(ctypes.byref(c_srf_cfg), ctypes.byref(c_cfg))
+    if not srf:
+        raise RuntimeError(
+            "atcorr_srf_compute returned NULL — "
+            "is uvspec installed? Check LIBRADTRAN_DIR / LIBRADTRAN_DATA."
+        )
+
+    _lib.atcorr_srf_apply(srf, ctypes.byref(c_cfg), ctypes.byref(c_arr))
+    _lib.atcorr_srf_free(srf)
+
+    shape = (n_aod, n_h2o, n_wl)
+    return LutArrays(
+        R_atm  = Ra.reshape(shape),
+        T_down = Td.reshape(shape),
+        T_up   = Tu.reshape(shape),
+        s_alb  = sa.reshape(shape),
+    )

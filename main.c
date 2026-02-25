@@ -74,10 +74,12 @@ static void write_f32a(FILE *fp, const float *v, size_t n)
 
 /* ── Band wavelength parsing from r3.info -h ─────────────────────────────── */
 
-/* Parse per-band centre wavelengths from `r3.info -h` output.
- * Looks for lines:  "  Band N: WL nm, FWHM: F nm"
- * Fills wl[0..max_n-1] in µm (-1 = not found).  Returns count parsed. */
-static int parse_band_wl(const char *mapname, float *wl, int max_n)
+/* Parse per-band centre wavelengths and optional FWHM from `r3.info -h`.
+ * Looks for lines:  "  Band N: WL nm"  or  "  Band N: WL nm, FWHM: F nm"
+ * Fills wl[0..max_n-1] in µm (-1 = not found).
+ * If fwhm != NULL, fills fwhm[0..max_n-1] in µm (0 = not found).
+ * Returns count of wavelengths parsed. */
+static int parse_band_wl(const char *mapname, float *wl, float *fwhm, int max_n)
 {
     const char *gisbase = getenv("GISBASE");
     char cmd[1024];
@@ -87,7 +89,10 @@ static int parse_band_wl(const char *mapname, float *wl, int max_n)
     FILE *fp = popen(cmd, "r");
     if (!fp) return 0;
 
-    for (int i = 0; i < max_n; i++) wl[i] = -1.0f;
+    for (int i = 0; i < max_n; i++) {
+        wl[i] = -1.0f;
+        if (fwhm) fwhm[i] = 0.0f;
+    }
 
     char line[512];
     int  n = 0;
@@ -97,6 +102,14 @@ static int parse_band_wl(const char *mapname, float *wl, int max_n)
         if (sscanf(line, " Band %d: %lf nm", &bnum, &wl_nm) == 2) {
             if (bnum >= 1 && bnum <= max_n) {
                 wl[bnum - 1] = (float)(wl_nm * 1e-3); /* nm → µm */
+                if (fwhm) {
+                    const char *fp_str = strstr(line, "FWHM:");
+                    if (fp_str) {
+                        double fwhm_nm;
+                        if (sscanf(fp_str, "FWHM: %lf nm", &fwhm_nm) == 1)
+                            fwhm[bnum - 1] = (float)(fwhm_nm * 1e-3);
+                    }
+                }
                 n++;
             }
         }
@@ -123,7 +136,7 @@ static float interp_wl(const float *arr, const float *lut_wl, int n, float wl_um
 /* ── Atmospheric correction of a Raster3D cube ───────────────────────────── */
 
 static void correct_raster3d(const char *input_name, const char *output_name,
-                              const LutConfig *cfg, const LutArrays *lut,
+                              const LutConfig *cfg, LutArrays *lut,
                               float aod_val, float h2o_val,
                               int doy, float sza_deg)
 {
@@ -150,9 +163,10 @@ static void correct_raster3d(const char *input_name, const char *output_name,
     G_verbose_message(_("Input <%s>: %d rows × %d cols × %d bands"),
                       input_name, nrows, ncols, ndepths);
 
-    /* ── Parse per-band wavelengths from r3.info metadata ── */
-    float *band_wl = G_malloc(ndepths * sizeof(float));
-    int    n_parsed = parse_band_wl(input_name, band_wl, ndepths);
+    /* ── Parse per-band wavelengths and FWHM from r3.info metadata ── */
+    float *band_wl   = G_malloc(ndepths * sizeof(float));
+    float *band_fwhm = G_malloc(ndepths * sizeof(float));
+    int    n_parsed  = parse_band_wl(input_name, band_wl, band_fwhm, ndepths);
 
     if (n_parsed == 0) {
         G_warning(_("No wavelength metadata in <%s>; "
@@ -167,6 +181,46 @@ static void correct_raster3d(const char *input_name, const char *output_name,
     } else {
         G_verbose_message(_("Band wavelengths: %.4f–%.4f µm"),
                           band_wl[0], band_wl[ndepths - 1]);
+    }
+
+    /* ── SRF correction for sub-nm sensors ──
+     * If any parsed FWHM is below the 5 nm threshold, compute and apply a
+     * per-band correction that replaces the coarse 6SV gas parameterisation
+     * with libRadtran reptran fine (~0.05 nm) convolved with the Gaussian SRF.
+     * The full LUT is corrected in-place before the per-pixel inversion loop. */
+    {
+        float min_fwhm_nm = 1e9f;
+        int   n_fwhm_parsed = 0;
+        for (int b = 0; b < ndepths; b++) {
+            if (band_fwhm[b] > 0.0f) {
+                n_fwhm_parsed++;
+                float fwhm_nm = band_fwhm[b] * 1000.0f;
+                if (fwhm_nm < min_fwhm_nm) min_fwhm_nm = fwhm_nm;
+            }
+        }
+
+        if (n_fwhm_parsed > 0 && min_fwhm_nm < 5.0f) {
+            G_message(_("Sub-nm sensor detected (min FWHM=%.2f nm, %d bands): "
+                        "applying reptran fine SRF gas correction..."),
+                      min_fwhm_nm, n_fwhm_parsed);
+
+            SrfConfig srf_cfg = {
+                .fwhm_um      = band_fwhm,
+                .threshold_um = 0.005f,   /* 5 nm */
+            };
+            SrfCorrection *srf = atcorr_srf_compute(&srf_cfg, cfg);
+            if (srf) {
+                atcorr_srf_apply(srf, cfg, lut);
+                atcorr_srf_free(srf);
+                G_verbose_message(_("SRF gas correction applied to LUT."));
+            } else {
+                G_warning(_("SRF correction failed (uvspec not found?); "
+                            "proceeding with uncorrected LUT"));
+            }
+        } else if (n_fwhm_parsed == 0) {
+            G_verbose_message(_("No FWHM metadata found; "
+                                "skipping SRF correction"));
+        }
     }
 
     /* Warn if any band falls outside the LUT spectral range */
@@ -255,6 +309,7 @@ static void correct_raster3d(const char *input_name, const char *output_name,
         G_fatal_error(_("Cannot close output map <%s>"), output_name);
 
     G_free(band_wl);
+    G_free(band_fwhm);
     G_free(Rs); G_free(Tds); G_free(Tus); G_free(ss);
 
     G_message(_("Surface reflectance written to <%s>"), output_name);
