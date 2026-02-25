@@ -48,6 +48,7 @@ if _lib is None:
 
 # ── C struct mirrors ──────────────────────────────────────────────────────────
 class _LutConfigC(ctypes.Structure):
+    # BrdfParams union: largest member = ocean (5 floats = 20 bytes)
     _fields_ = [
         ("wl",               ctypes.POINTER(ctypes.c_float)),
         ("n_wl",             ctypes.c_int),
@@ -63,6 +64,14 @@ class _LutConfigC(ctypes.Structure):
         ("aerosol_model",    ctypes.c_int),
         ("surface_pressure", ctypes.c_float),
         ("ozone_du",         ctypes.c_float),
+        # Custom Mie fields (Phase 4)
+        ("mie_r_mode",       ctypes.c_float),
+        ("mie_sigma_g",      ctypes.c_float),
+        ("mie_m_real",       ctypes.c_float),
+        ("mie_m_imag",       ctypes.c_float),
+        # BRDF fields (Phase 5): brdf_type (int) + brdf_params (union, 5 floats)
+        ("brdf_type",        ctypes.c_int),
+        ("brdf_params",      ctypes.c_float * 5),
     ]
 
 
