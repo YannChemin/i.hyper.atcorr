@@ -3,6 +3,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "brdf.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,6 +15,7 @@ extern "C" {
 #define AEROSOL_MARITIME     2
 #define AEROSOL_URBAN        3
 #define AEROSOL_DESERT       5
+#define AEROSOL_CUSTOM       9   /* custom Mie log-normal via mie.c */
 
 /* Atmosphere model identifiers */
 #define ATMO_US62            1   /* US standard 1962 */
@@ -56,6 +58,16 @@ typedef struct {
 
     /* Ozone column (Dobson units, 0 = standard atmosphere) */
     float ozone_du;
+
+    /* ── Custom Mie aerosol (used when aerosol_model == AEROSOL_CUSTOM) ── */
+    float mie_r_mode;    /* log-normal mode radius (µm), e.g. 0.12 */
+    float mie_sigma_g;   /* geometric standard deviation, e.g. 1.8  */
+    float mie_m_real;    /* real refractive index at 550 nm          */
+    float mie_m_imag;    /* imaginary refractive index at 550 nm     */
+
+    /* ── BRDF surface model ──────────────────────────────────────────── */
+    BrdfType   brdf_type;    /* surface reflectance model (default: BRDF_LAMBERTIAN) */
+    BrdfParams brdf_params;  /* per-model parameters                                */
 } LutConfig;
 
 /* LUT output arrays — all have size [n_aod × n_h2o × n_wl] (C order: aod, h2o, wl)
@@ -108,6 +120,17 @@ void atcorr_lut_slice(const LutConfig *cfg, const LutArrays *lut,
                       float aod_val, float h2o_val,
                       float *Rs, float *Tds, float *Tus, float *ss);
 
+/* Trilinear interpolation of the LUT at a single (aod_val, h2o_val, wl_um)
+ * point.  Outputs a single set of (R_atm, T_down, T_up, s_alb) for one pixel.
+ * All values clamped to LUT grid boundaries; no extrapolation.
+ *
+ * Used for per-pixel correction when AOD/H2O raster maps are provided, and
+ * for AOD-perturbation uncertainty estimation. */
+void atcorr_lut_interp_pixel(const LutConfig *cfg, const LutArrays *lut,
+                               float aod_val, float h2o_val, float wl_um,
+                               float *R_atm, float *T_down,
+                               float *T_up,  float *s_alb);
+
 /* ─── SRF convolution correction ─────────────────────────────────────────── */
 
 /* Configuration for per-band Gaussian SRF gas-transmittance correction.
@@ -148,6 +171,33 @@ void atcorr_srf_apply(const SrfCorrection *srf,
 
 /* Release memory allocated by atcorr_srf_compute(). */
 void atcorr_srf_free(SrfCorrection *srf);
+
+/* ─── Solar position ──────────────────────────────────────────────────────── */
+
+/* Compute solar zenith (asol, degrees) and azimuth (phi0, degrees).
+ * month, jday: calendar date; tu: UTC decimal hours;
+ * xlon: longitude (deg E); xlat: latitude (deg N);
+ * ia: year (non-zero enables leap-year correction). */
+void sixs_possol(int month, int jday, float tu, float xlon, float xlat,
+                 float *asol, float *phi0, int ia);
+
+/* ─── Rayleigh analytical reflectance ────────────────────────────────────── */
+
+/* Chandrasekhar analytical Rayleigh reflectance.
+ * xphi: relative azimuth (degrees, 0=backscatter); xmuv: cos(vza);
+ * xmus: cos(sza); xtau: Rayleigh optical depth.
+ * Returns molecular reflectance (0–1). */
+float sixs_chand(float xphi, float xmuv, float xmus, float xtau);
+
+/* ─── Environmental (adjacency) correction ────────────────────────────────── */
+
+/* Compute adjacency-effect correction factors.
+ * difr: diffuse Rayleigh OD; difa: diffuse aerosol OD;
+ * r: total aerosol OD at 550 nm; palt: sensor altitude (km);
+ * xmuv: cos(vza).
+ * Outputs: fra (Rayleigh factor), fae (aerosol factor), fr (combined). */
+void sixs_enviro(float difr, float difa, float r, float palt, float xmuv,
+                 float *fra, float *fae, float *fr);
 
 /* ─── Version info ────────────────────────────────────────────────────────── */
 const char *atcorr_version(void);

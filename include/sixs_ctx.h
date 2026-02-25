@@ -76,11 +76,19 @@ typedef struct {
     bool ier;    /* error flag */
 } SixsErr;
 
+/* /aeroprof/ — aerosol vertical profile discretised into NT_P layers */
+typedef struct {
+    float ext_layer[NT_P];  /* relative aerosol extinction per layer */
+    float ome_layer[NT_P];  /* single scattering albedo per layer */
+    int   n_layers;         /* number of filled layers (≤ NT_P) */
+} SixsAerProf;
+
 /* Master context struct — one per thread */
 typedef struct {
     SixsAtm        atm;
     SixsDel        del;
     SixsAer        aer;
+    SixsAerProf    aerprof;
     SixsPolar      polar;
     SixsDisc       disc;
     SixsQuad       quad;
