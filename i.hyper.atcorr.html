@@ -12,24 +12,28 @@
 <hr class="header">
 
 <h2>NAME</h2>
-<em><b>i.hyper.atcorr</b></em> - Computes an atmospheric correction look-up table (LUT)
-using the 6SV2.1 radiative transfer algorithm.
+<em><b>i.hyper.atcorr</b></em> - Atmospheric correction of hyperspectral imagery
+using the 6SV2.1 radiative transfer algorithm with ISOFIT-inspired improvements.
 
 <h2>KEYWORDS</h2>
 <a href="imagery.html">imagery</a>,
 <a href="topic_atmospheric_correction.html">atmospheric correction</a>,
 <a href="topic_radiative_transfer.html">radiative transfer</a>,
-6SV, hyperspectral, LUT
+6SV, hyperspectral, LUT, ISOFIT, uncertainty
 
 <h2>SYNOPSIS</h2>
 <div id="name"><b>i.hyper.atcorr</b><br></div>
 <b>i.hyper.atcorr --help</b><br>
 <div id="synopsis"><b>i.hyper.atcorr</b>
-<b>output</b>=<em>name</em>
+[<b>-ur</b>]
+[<b>input</b>=<em>name</em>]
+[<b>output</b>=<em>name</em>]
+[<b>lut</b>=<em>name</em>]
 <b>sza</b>=<em>float</em>
 [<b>vza</b>=<em>float</em>]
 [<b>raa</b>=<em>float</em>]
 [<b>altitude</b>=<em>float</em>]
+[<b>doy</b>=<em>integer</em>]
 [<b>atmosphere</b>=<em>string</em>]
 [<b>aerosol</b>=<em>string</em>]
 [<b>ozone</b>=<em>float</em>]
@@ -38,12 +42,24 @@ using the 6SV2.1 radiative transfer algorithm.
 [<b>wl_min</b>=<em>float</em>]
 [<b>wl_max</b>=<em>float</em>]
 [<b>wl_step</b>=<em>float</em>]
+[<b>aod_val</b>=<em>float</em>]
+[<b>h2o_val</b>=<em>float</em>]
+[<b>aod_map</b>=<em>name</em>]
+[<b>h2o_map</b>=<em>name</em>]
+[<b>smooth</b>=<em>float</em>]
+[<b>adj_psf</b>=<em>float</em>]
+[<b>pixel_size</b>=<em>float</em>]
+[<b>uncertainty</b>=<em>name</em>]
 [--<b>verbose</b>]
 [--<b>help</b>]
 </div>
 
 <h3>Flags:</h3>
 <dl>
+<dt><b>-u</b></dt>
+<dd>Compute per-band, per-pixel reflectance uncertainty (#4)</dd>
+<dt><b>-r</b></dt>
+<dd>Apply surface prior MAP regularisation after all bands are inverted (#3/#5/#6)</dd>
 <dt><b>--verbose</b></dt>
 <dd>Print summary statistics after LUT computation</dd>
 <dt><b>--help</b></dt>
@@ -52,8 +68,14 @@ using the 6SV2.1 radiative transfer algorithm.
 
 <h3>Parameters:</h3>
 <dl>
-<dt><b>output</b>=<em>name</em> <b>[required]</b></dt>
-<dd>Output LUT binary file (conventionally <tt>.lut</tt>)</dd>
+<dt><b>input</b>=<em>name</em></dt>
+<dd>Input TOA radiance Raster3D cube in W/(m&sup2; sr &micro;m)</dd>
+
+<dt><b>output</b>=<em>name</em></dt>
+<dd>Output BOA surface reflectance Raster3D cube</dd>
+
+<dt><b>lut</b>=<em>name</em></dt>
+<dd>Binary LUT file: written when generating, read when correcting (or both)</dd>
 
 <dt><b>sza</b>=<em>float</em> <b>[required]</b></dt>
 <dd>Solar zenith angle in degrees (0 to &lt;90)</dd>
@@ -65,7 +87,10 @@ using the 6SV2.1 radiative transfer algorithm.
 <dd>Relative azimuth angle between sun and sensor in degrees; default: <tt>0</tt></dd>
 
 <dt><b>altitude</b>=<em>float</em></dt>
-<dd>Sensor altitude in km; values &gt;900 are treated as satellite; default: <tt>1000</tt></dd>
+<dd>Sensor altitude in km; values &gt;900 treated as satellite; default: <tt>1000</tt></dd>
+
+<dt><b>doy</b>=<em>integer</em></dt>
+<dd>Day of year for Earth-Sun distance correction (1&ndash;365); default: <tt>180</tt></dd>
 
 <dt><b>atmosphere</b>=<em>string</em></dt>
 <dd>Standard atmosphere model; options: <tt>us62</tt>, <tt>midsum</tt>,
@@ -96,20 +121,54 @@ default: <tt>0.5,1.0,2.0,3.5,5.0</tt></dd>
 
 <dt><b>wl_step</b>=<em>float</em></dt>
 <dd>Wavelength step in micrometres; default: <tt>0.01</tt></dd>
+
+<dt><b>aod_val</b>=<em>float</em></dt>
+<dd>Scene-average AOD at 550&nbsp;nm (scalar fallback when no aod_map); default: <tt>0.1</tt></dd>
+
+<dt><b>h2o_val</b>=<em>float</em></dt>
+<dd>Scene-average column water vapour g/cm&sup2; (scalar fallback when no h2o_map); default: <tt>2.0</tt></dd>
+
+<dt><b>aod_map</b>=<em>name</em></dt>
+<dd>Per-pixel AOD raster map (2-D); overrides aod_val when provided (#1)</dd>
+
+<dt><b>h2o_map</b>=<em>name</em></dt>
+<dd>Per-pixel column water vapour raster map g/cm&sup2; (2-D); overrides h2o_val when provided (#1)</dd>
+
+<dt><b>smooth</b>=<em>float</em></dt>
+<dd>Gaussian smoothing &sigma; in pixels applied to aod_map/h2o_map before correction; 0 = off (#1)</dd>
+
+<dt><b>adj_psf</b>=<em>float</em></dt>
+<dd>Adjacency effect PSF radius in km (Vermote 1997); 0 = off (#2); default: <tt>0</tt></dd>
+
+<dt><b>pixel_size</b>=<em>float</em></dt>
+<dd>Pixel size in metres for adjacency correction; 0 = auto-detect from GRASS region (#2)</dd>
+
+<dt><b>uncertainty</b>=<em>name</em></dt>
+<dd>Output per-pixel reflectance uncertainty Raster3D; requires -u flag (#4)</dd>
 </dl>
 
 <h2>DESCRIPTION</h2>
 
-<em>i.hyper.atcorr</em> computes a multi-dimensional atmospheric correction
-look-up table (LUT) using a C port of the 6SV2.1 (Second Simulation of a
-Satellite Signal in the Solar Spectrum, version 2.1) radiative transfer
-code with OpenMP parallelisation over the AOD dimension.
+<em>i.hyper.atcorr</em> is a GRASS GIS add-on for atmospheric correction of
+hyperspectral imagery. It operates in two complementary modes that can be
+combined in a single invocation:
+
+<ul>
+  <li><b>LUT generation</b> (<tt>lut=</tt>): compute a binary look-up table of
+      atmospheric parameters over an [AOD &times; H<sub>2</sub>O &times; wavelength] grid.</li>
+  <li><b>Cube correction</b> (<tt>input=</tt> / <tt>output=</tt>): apply the LUT
+      to a Raster3D radiance cube, writing a surface (BOA) reflectance cube.</li>
+</ul>
 
 <p>
-The LUT spans a grid of AOD (aerosol optical depth at 550&nbsp;nm) and
-column water vapour (H<sub>2</sub>O) values at a set of user-specified
-wavelengths. For each grid point the module stores four atmospheric
-parameters:
+The LUT is computed using a C port of the 6SV2.1 (Second Simulation of
+a Satellite Signal in the Solar Spectrum, version 2.1) radiative transfer code
+with OpenMP parallelisation over the AOD dimension.
+</p>
+
+<p>
+For each (AOD, H<sub>2</sub>O, &lambda;) grid point the module stores four
+atmospheric parameters:
 </p>
 <ul>
   <li><b>R_atm</b> &mdash; atmospheric path reflectance</li>
@@ -119,18 +178,116 @@ parameters:
 </ul>
 
 <p>
-These four parameters are sufficient to invert a top-of-atmosphere (TOA)
-reflectance image to surface (BOA) reflectance via the standard
-algebraic formula:
+Inversion from TOA radiance <em>L</em> to BOA reflectance uses the standard
+6SV formula:
 </p>
 <pre>
-  rho_boa = (rho_toa - R_atm) / (T_down * T_up * (1 + s_alb * rho_boa))
+  &rho;_toa = (&pi; &times; L &times; d&sup2;) / (E&sub0; &times; cos &theta;_s)
+  &rho;_boa = (&rho;_toa &minus; R_atm) / (T_down &times; T_up &times; (1 + s_alb &times; &rho;_boa))
 </pre>
+<p>
+where <em>E&sub0;</em> is the Thuillier solar irradiance (from 6SV2.1 tables) and
+<em>d&sup2;</em> is the squared Earth-Sun distance for the acquisition day-of-year.
+</p>
+
+<h2>ISOFIT-INSPIRED IMPROVEMENTS</h2>
 
 <p>
-The output is a compact binary LUT file intended for use by
-<em>i.hyper.smac</em>, which loads it via the <tt>atcorr.py</tt>
-Python ctypes bindings bundled with the add-on.
+Six improvements inspired by the
+<a href="https://github.com/isofit/isofit">ISOFIT</a> framework are available
+as optional flags and parameters. They can be combined freely; each defaults
+to disabled for full backward compatibility.
+</p>
+
+<h3>#1 &mdash; Per-pixel atmospheric maps + spatial smoothing</h3>
+
+<p>
+Supply 2-D raster maps of AOD (at 550&nbsp;nm) and/or column water vapour
+(g/cm&sup2;) derived from Dark Target, MAIAC, or any retrieval product.
+Per-pixel values replace the scalar <tt>aod_val=</tt> / <tt>h2o_val=</tt>
+fallbacks; each pixel is corrected using trilinear LUT interpolation at its
+own (aod, h2o, &lambda;) point.
+</p>
+<p>
+<tt>smooth=</tt> applies a <b>separable Gaussian filter</b> (&sigma; in pixels)
+to the maps before correction, suppressing retrieval noise while preserving
+large-scale spatial gradients. Boundary pixels use edge-replication padding;
+NaN/null pixels are excluded from the neighbourhood average.
+</p>
+
+<h3>#2 &mdash; In-loop adjacency effect correction</h3>
+
+<p>
+Applies the <b>Vermote et al. (1997) adjacency correction</b> per band
+immediately after algebraic inversion, before spectral regularisation.
+The diffuse transmittance fraction carries signal from a spatially-averaged
+environmental neighbourhood reflectance:
+</p>
+<pre>
+  T_diff = clip(T_scat &minus; T_dir, 0, T_scat)
+  r_env  = box_filter(r_boa, radius = adj_psf / pixel_size)
+  r_boa += T_diff &times; s_alb &times; (r_boa &minus; r_env) / (1 &minus; s_alb &times; r_env)
+</pre>
+<p>
+<tt>T_dir</tt> is the Beer-Lambert two-way direct transmittance from Rayleigh
++ aerosol optical depths. <tt>pixel_size=</tt> is auto-detected from the GRASS
+computational region if not given.
+</p>
+
+<h3>#3 &amp; #5 &mdash; Surface prior MAP regularisation (<tt>-r</tt> flag)</h3>
+
+<p>
+After all bands have been inverted, blends each pixel's retrieved spectrum
+with a <b>3-component Gaussian mixture surface prior</b> (vegetation, soil,
+water) using diagonal-covariance MAP estimation:
+</p>
+<pre>
+  r_map[b] = (r_obs[b] / &sigma;_obs&sup2;[b]  +  r_prior[b] / &sigma;_prior&sup2;[b])
+             / (1/&sigma;_obs&sup2;[b]  +  1/&sigma;_prior&sup2;[b])
+</pre>
+<p>
+Each pixel is classified to the nearest component using VNIR bands
+(0.40&ndash;1.00&nbsp;&micro;m). Prior means are hardcoded reference spectra interpolated
+to the sensor wavelengths; prior variances scale as <tt>(scale &times; mean)&sup2;</tt>
+(vegetation 15&nbsp;%, soil 20&nbsp;%, water 3&nbsp;%). The <tt>-r</tt> flag requires loading
+the full reflectance cube into memory (~400&nbsp;MB for a 426-band Tanager scene).
+</p>
+
+<h3>#4 &mdash; Per-band reflectance uncertainty (<tt>-u</tt> flag)</h3>
+
+<p>
+Computes per-pixel reflectance uncertainty (&sigma;_rfl) for each band from
+two propagated sources:
+</p>
+<ol>
+  <li><b>Instrument noise</b>: NEDL estimated from the standard deviation of
+      the darkest 5&nbsp;% of radiance pixels &rarr; propagated as
+      <tt>&sigma;_noise = &pi; &times; NEDL &times; d&sup2; / (E&sub0; &times; cos &theta;_s &times; T_total)</tt></li>
+  <li><b>AOD uncertainty</b>: LUT evaluated at <tt>aod &plusmn; 0.04</tt>; half the
+      reflectance difference gives &sigma;_aod per pixel.</li>
+</ol>
+<p>Total: <tt>&sigma;_rfl = &radic;(&sigma;_noise&sup2; + &sigma;_aod&sup2;)</tt></p>
+<p>
+When <tt>-r</tt> is also enabled, the uncertainty cube feeds the MAP
+regularisation as &sigma;_obs&sup2;.
+</p>
+
+<h3>#6 &mdash; Model discrepancy noise floor</h3>
+
+<p>
+When both <tt>-u</tt> and <tt>-r</tt> are active, a <b>per-band model discrepancy</b>
+term is added in quadrature to &sigma;_rfl before MAP regularisation.
+It reflects systematic RT model errors:
+</p>
+<ul>
+  <li>Baseline: 0.5&nbsp;% (all bands)</li>
+  <li>Gas absorption band edges (720, 760, 940, 1135, 1380, 1850&nbsp;nm):
+      +2&nbsp;% Gaussian bump (&sigma;&nbsp;=&nbsp;30&nbsp;nm)</li>
+  <li>SWIR &gt;1500&nbsp;nm: +1&nbsp;% (aerosol model uncertainty)</li>
+</ul>
+<p>
+This prevents over-regularisation in bands where the 6SV gas
+parameterisation is least accurate.
 </p>
 
 <h2>NOTES</h2>
@@ -154,7 +311,10 @@ following layout:
   T_up  [n_aod*n_h2o*n_wl]   float32
   s_alb [n_aod*n_h2o*n_wl]   float32
 </pre>
-<p>Array indexing is C order: the wavelength index varies fastest.</p>
+<p>
+Array indexing is C order: the wavelength index varies fastest.
+Typical size: ~4&nbsp;MB for 6&nbsp;AOD &times; 5&nbsp;H<sub>2</sub>O &times; 211&nbsp;wavelengths.
+</p>
 
 <h3>Radiative transfer</h3>
 <p>
@@ -171,15 +331,34 @@ scattering LUT only needs to be computed once per AOD value.
 <p>
 Each AOD grid point is independent and is computed in a separate OpenMP
 thread. On a 4-core machine a 6&nbsp;AOD&nbsp;&times;&nbsp;5&nbsp;H<sub>2</sub>O&nbsp;&times;&nbsp;211&nbsp;band
-LUT takes approximately one second.
+LUT takes approximately one second. The Gaussian spatial filter, adjacency
+correction, uncertainty computation, and MAP regularisation all use
+additional OpenMP parallel regions.
+</p>
+
+<h3>Cube correction memory</h3>
+<p>
+When <tt>-r</tt> is active, the full reflectance cube is held in memory for
+MAP regularisation. Memory usage is approximately
+<tt>n_bands &times; n_pixels &times; 4</tt>&nbsp;bytes. For a 426-band Tanager scene
+with a typical 640&nbsp;&times;&nbsp;480 tile this is about 400&nbsp;MB.
+When <tt>-r</tt> is not set, bands are written to the output Raster3D
+immediately after inversion.
+</p>
+
+<h3>Band wavelength metadata</h3>
+<p>
+When correcting a Raster3D cube the module auto-reads band wavelengths
+from <tt>r3.info -h</tt> metadata in the format <tt>Band N: WL nm</tt>.
+Make sure this metadata is present in the input cube.
 </p>
 
 <h2>EXAMPLES</h2>
 
-<h3>Generate a LUT for a Tanager scene over Kanpur</h3>
+<h3>LUT generation only</h3>
 <pre>
 i.hyper.atcorr \
-    output=kanpur_lut.lut \
+    lut=kanpur.lut \
     sza=35.2 vza=4.1 raa=97 \
     atmosphere=midsum aerosol=continental ozone=310 \
     aod=0.0,0.05,0.1,0.2,0.4,0.8 \
@@ -187,10 +366,40 @@ i.hyper.atcorr \
     wl_min=0.376 wl_max=2.499 wl_step=0.005
 </pre>
 
+<h3>Correction with scalar atmospheric state</h3>
+<pre>
+i.hyper.atcorr \
+    input=tanager_radiance output=tanager_refl \
+    lut=kanpur.lut \
+    sza=35.2 vza=4.1 raa=97 doy=45 \
+    aod_val=0.18 h2o_val=3.5 \
+    atmosphere=midsum aerosol=continental
+</pre>
+
+<h3>Full ISOFIT pipeline &mdash; all 6 improvements</h3>
+<pre>
+i.hyper.atcorr -u -r \
+    input=tanager_radiance output=tanager_refl \
+    sza=35.2 vza=4.1 raa=97 doy=45 \
+    aod_val=0.18 h2o_val=3.5 \
+    atmosphere=midsum aerosol=continental \
+    aod_map=maiac_aod h2o_map=mod05_wvc \
+    smooth=3 \
+    adj_psf=1.0 \
+    uncertainty=tanager_refl_unc
+</pre>
+<p>Runs with:</p>
+<ul>
+  <li>Per-pixel AOD from MAIAC, H<sub>2</sub>O from MOD05, Gaussian-smoothed at &sigma;=3&nbsp;px</li>
+  <li>Adjacency correction with 1&nbsp;km PSF (pixel size auto-detected from region)</li>
+  <li>Surface prior MAP regularisation (vegetation / soil / water prior)</li>
+  <li>Uncertainty output in <tt>tanager_refl_unc</tt> Raster3D</li>
+</ul>
+
 <h3>Quick test at coarse spectral resolution</h3>
 <pre>
 i.hyper.atcorr --verbose \
-    output=/tmp/test.lut \
+    lut=/tmp/test.lut \
     sza=30 vza=0 raa=0 \
     aod=0.0,0.2,0.4 h2o=2.0,4.0 \
     wl_min=0.4 wl_max=2.5 wl_step=0.05
@@ -212,6 +421,15 @@ J.J. (1997): Second simulation of the satellite signal in the solar spectrum,
 Validation of a vector version of the 6S radiative transfer code for
 atmospheric correction of satellite data. <em>Applied Optics</em>,
 45(26), 6762&ndash;6778.</li>
+<li>Thompson, D.R. et al. (2018): Optimal estimation for imaging
+spectrometer atmospheric correction. <em>Remote Sensing of Environment</em>,
+216, 355&ndash;373. (ISOFIT)</li>
+<li>Vermote, E.F., El Saleous, N., Justice, C.O., Kaufman, Y.J.,
+Privette, J.L., Remer, L., Roger, J.C. and Tanr&eacute;, D. (1997):
+Atmospheric correction of visible to middle-infrared EOS-MODIS data over
+land surfaces: Background, operational algorithm and validation.
+<em>Journal of Geophysical Research: Atmospheres</em>, 102(D14),
+17131&ndash;17141. (adjacency correction)</li>
 </ul>
 
 <h2>AUTHORS</h2>
