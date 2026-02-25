@@ -37,16 +37,31 @@ static const float std_mix[3][4] = {
 /* Volume fractions (vi in 6SV) for each component — from d'Almeida 1991 */
 static const float vi[4] = { 0.09f, 0.25f, 1.00f, 0.01f };
 
+/* Forward declaration: Mie initialisation (src/mie.c) */
+void sixs_mie_init(SixsCtx *ctx,
+                   double r_mode, double sigma_g,
+                   double m_r_550, double m_i_550);
+
 /* Initialize aerosol optical properties in context for a given model and AOD.
- * iaer: 0=none, 1=continental, 2=maritime, 3=urban, 5=desert(treated as continental)
+ * iaer: 0=none, 1=continental, 2=maritime, 3=urban, 5=desert(treated as continental),
+ *       9=custom Mie log-normal (r_mode,sigma_g,m_r,m_i set externally via sixs_mie_init).
  * taer55: aerosol optical depth at 550nm
  * xmud: cosine of scattering angle (for phase function)
+ * For AEROSOL_CUSTOM the caller must have already called sixs_mie_init() to populate
+ * ctx->aer; this function then only checks the no-aerosol path.
  */
 void sixs_aerosol_init(SixsCtx *ctx, int iaer, float taer55, float xmud) {
     if (iaer == 0 || taer55 <= 0.0f) {
         memset(&ctx->aer, 0, sizeof(ctx->aer));
         /* For pure Rayleigh: ext[8]=1 to avoid divide-by-zero in DISCOM */
         ctx->aer.ext[7] = 1.0f;
+        return;
+    }
+
+    /* Custom Mie: ctx->aer already populated by sixs_mie_init() */
+    if (iaer == 9) {
+        /* Only rebuild ctx->polar from ctx->aer (re-use the Legendre expansion
+         * that sixs_mie_init already filled).  Nothing more to do here. */
         return;
     }
 

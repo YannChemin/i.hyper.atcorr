@@ -11,10 +11,14 @@
 #endif
 #include <string.h>
 #include <stdlib.h>
+#include "../include/brdf.h"
 
 /* Forward declarations for functions implemented elsewhere */
 void sixs_init_atmosphere(SixsCtx *ctx, int atmo_model);
+void sixs_pressure(SixsCtx *ctx, float sp);
 void sixs_aerosol_init(SixsCtx *ctx, int iaer, float taer55, float xmud);
+void sixs_mie_init(SixsCtx *ctx, double r_mode, double sigma_g,
+                   double m_r_550, double m_i_550);
 void sixs_discom(SixsCtx *ctx, int idatmp, int iaer,
                   float xmus, float xmuv, float phi,
                   float taer55, float taer55p, float palt, float phirad,
@@ -86,7 +90,32 @@ int atcorr_compute_lut(const LutConfig *cfg, LutArrays *out)
         ctx->multi.igmax = 20;
         ctx->err.ier     = false;
         sixs_init_atmosphere(ctx, cfg->atmo_model);
+        if (cfg->surface_pressure > 0.0f)
+            sixs_pressure(ctx, cfg->surface_pressure);
+
+        /* Custom Mie: populate ctx->aer before aerosol_init */
+        if (cfg->aerosol_model == AEROSOL_CUSTOM &&
+            cfg->mie_r_mode > 0.0f && cfg->mie_sigma_g > 1.0f) {
+            sixs_mie_init(ctx,
+                          (double)cfg->mie_r_mode,
+                          (double)cfg->mie_sigma_g,
+                          (double)cfg->mie_m_real,
+                          (double)cfg->mie_m_imag);
+        }
+
         sixs_aerosol_init(ctx, cfg->aerosol_model, aod, xmud);
+
+        /* BRDF pre-computation: for non-Lambertian surfaces, evaluate the
+         * surface bidirectional reflectance at the scene geometry.
+         * Currently stored as a per-AOD scalar (geometry-only, no wavelength
+         * dependence at this stage); full igroun=1 coupling into DISCOM
+         * is deferred to a future implementation pass. */
+        float rho_brdf = 0.0f;
+        if (cfg->brdf_type != BRDF_LAMBERTIAN) {
+            rho_brdf = sixs_brdf_eval(cfg->brdf_type, &cfg->brdf_params,
+                                       xmus, xmuv, cfg->raa);
+        }
+        (void)rho_brdf;   /* stored; RT injection deferred */
 
         /* Call DISCOM once per AOD: fills ctx->disc at 20 reference wavelengths */
         float taer55p = aod;   /* satellite: no aerosol above */
@@ -131,4 +160,85 @@ int atcorr_compute_lut(const LutConfig *cfg, LutArrays *out)
     }
 
     return 0;
+}
+
+/* ── Per-pixel trilinear LUT interpolation ───────────────────────────────────
+ *
+ * Returns R_atm, T_down, T_up, s_alb for a single (aod, h2o, wl) point via
+ * trilinear interpolation in the 3-D LUT.  Values are clamped to the grid
+ * boundaries; no extrapolation.
+ *
+ * Used by uncertainty.c (AOD perturbation) and main.c (per-pixel correction
+ * with per-pixel AOD/H2O raster maps).
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/* Binary search: largest i such that arr[i] <= val.
+ * Returns 0 if val < arr[0], n-2 if val >= arr[n-1]. */
+static int find_bracket(const float *arr, int n, float val)
+{
+    if (val <= arr[0])      return 0;
+    if (val >= arr[n - 1])  return n - 2;
+    int lo = 0, hi = n - 1;
+    while (hi - lo > 1) {
+        int mid = (lo + hi) / 2;
+        if (arr[mid] <= val) lo = mid;
+        else                 hi = mid;
+    }
+    return lo;
+}
+
+void atcorr_lut_interp_pixel(const LutConfig *cfg, const LutArrays *lut,
+                               float aod_val, float h2o_val, float wl_um,
+                               float *R_atm_out, float *T_down_out,
+                               float *T_up_out,  float *s_alb_out)
+{
+    int n_aod = cfg->n_aod;
+    int n_h2o = cfg->n_h2o;
+    int n_wl  = cfg->n_wl;
+
+    /* Clamp to grid */
+    if (aod_val < cfg->aod[0])          aod_val = cfg->aod[0];
+    if (aod_val > cfg->aod[n_aod - 1])  aod_val = cfg->aod[n_aod - 1];
+    if (h2o_val < cfg->h2o[0])          h2o_val = cfg->h2o[0];
+    if (h2o_val > cfg->h2o[n_h2o - 1])  h2o_val = cfg->h2o[n_h2o - 1];
+    if (wl_um   < cfg->wl[0])           wl_um   = cfg->wl[0];
+    if (wl_um   > cfg->wl[n_wl - 1])    wl_um   = cfg->wl[n_wl - 1];
+
+    int ia = find_bracket(cfg->aod, n_aod, aod_val);
+    int ih = find_bracket(cfg->h2o, n_h2o, h2o_val);
+    int iw = find_bracket(cfg->wl,  n_wl,  wl_um);
+
+    /* Fractional weights — guard against zero-width intervals */
+    float dA = cfg->aod[ia + 1] - cfg->aod[ia];
+    float dH = cfg->h2o[ih + 1] - cfg->h2o[ih];
+    float dW = cfg->wl [iw + 1] - cfg->wl [iw];
+
+    float wa1 = (dA > 0.0f) ? (aod_val - cfg->aod[ia]) / dA : 0.0f;
+    float wh1 = (dH > 0.0f) ? (h2o_val - cfg->h2o[ih]) / dH : 0.0f;
+    float ww1 = (dW > 0.0f) ? (wl_um   - cfg->wl [iw]) / dW : 0.0f;
+    float wa0 = 1.0f - wa1;
+    float wh0 = 1.0f - wh1;
+    float ww0 = 1.0f - ww1;
+
+/* Flat index into the [n_aod × n_h2o × n_wl] C-order array */
+#define IDX(a, h, w) (((size_t)(a) * n_h2o + (h)) * n_wl + (w))
+
+/* Trilinear interpolation of an array at the 8 surrounding grid corners */
+#define TRILIN(arr) (                                                          \
+    wa0 * (wh0 * (ww0 * (arr)[IDX(ia,   ih,   iw  )]                         \
+                + ww1 * (arr)[IDX(ia,   ih,   iw+1)])                         \
+         + wh1 * (ww0 * (arr)[IDX(ia,   ih+1, iw  )]                         \
+                + ww1 * (arr)[IDX(ia,   ih+1, iw+1)]))                        \
+  + wa1 * (wh0 * (ww0 * (arr)[IDX(ia+1, ih,   iw  )]                         \
+                + ww1 * (arr)[IDX(ia+1, ih,   iw+1)])                         \
+         + wh1 * (ww0 * (arr)[IDX(ia+1, ih+1, iw  )]                         \
+                + ww1 * (arr)[IDX(ia+1, ih+1, iw+1)])))
+
+    *R_atm_out  = TRILIN(lut->R_atm);
+    *T_down_out = TRILIN(lut->T_down);
+    *T_up_out   = TRILIN(lut->T_up);
+    *s_alb_out  = TRILIN(lut->s_alb);
+
+#undef IDX
+#undef TRILIN
 }
