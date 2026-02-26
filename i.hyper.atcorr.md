@@ -453,6 +453,17 @@ a Raster3D radiance cube. Scene geometry, atmosphere, and aerosol type
 are chosen to reflect realistic acquisition conditions for the land cover
 and climate zone described.
 
+**Image-based retrieval quick reference** — which flags to activate per scene:
+
+| Example | Flags | Rationale |
+|---------|-------|-----------|
+| 1. Saharan dust | `-z dem=` | No DDV (barren desert); dry uniform H₂O; O₃ and elevation matter |
+| 2. Amazon | `-z -w -a` | Dense forest = ideal DDV; ~4 g/cm² WVC gradient; low tropical O₃ |
+| 3. Paris winter | `-z -a` | Variable O₃ (polar vortex); farmland DDV; dry winter air |
+| 4. Mediterranean | `-w -a` | Land–sea H₂O gradient; coastal DDV; stable O₃ |
+| 5. Sweden winter | `-z` | Polar O₃ enhancement at SZA=78°; snow = no DDV; very dry |
+| 6. Yukon summer | `-z -w -a dem=` | All four: boreal DDV + tundra WVC gradient + variable O₃ + elevation |
+
 ---
 
 ### 1. Saharan dust storm (desert, tropical atmosphere)

@@ -178,6 +178,17 @@ sudo cp dist.*/lib/libatcorr.so   /usr/local/grass85/lib/
 
 ## Usage
 
+**Image-based retrieval — which flags to activate per scene type**:
+
+| Scene | Flags | Rationale |
+|-------|-------|-----------|
+| Saharan dust | `-z dem=` | No DDV (barren desert); dry uniform H₂O; O₃ and elevation matter |
+| Amazon / tropical | `-z -w -a` | Dense forest = ideal DDV; ~4 g/cm² WVC gradient; low tropical O₃ |
+| Urban temperate winter | `-z -a` | Variable O₃ (polar vortex); farmland DDV; dry winter air |
+| Mediterranean coastal | `-w -a` | Land–sea H₂O gradient; coastal DDV; stable O₃ |
+| Sub-arctic winter | `-z` | Polar O₃ enhancement; snow = no DDV; very dry |
+| Boreal summer / mountain | `-z -w -a dem=` | All four: dense DDV + WVC gradient + variable O₃ + elevation |
+
 ### LUT generation only
 
 ```sh

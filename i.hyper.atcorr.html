@@ -566,6 +566,17 @@ chosen to reflect realistic acquisition conditions for the land cover and
 climate zone described.
 </p>
 
+<p><b>Image-based retrieval quick reference</b> &mdash; which flags to activate per scene:</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Example</th><th>Flags</th><th>Rationale</th></tr>
+<tr><td>1. Saharan dust</td><td><tt>-z dem=</tt></td><td>No DDV (barren desert); dry uniform H<sub>2</sub>O; O<sub>3</sub> and elevation matter</td></tr>
+<tr><td>2. Amazon</td><td><tt>-z -w -a</tt></td><td>Dense forest = ideal DDV; ~4 g/cm&sup2; WVC gradient; low tropical O<sub>3</sub></td></tr>
+<tr><td>3. Paris winter</td><td><tt>-z -a</tt></td><td>Variable O<sub>3</sub> (polar vortex); farmland DDV; dry winter air</td></tr>
+<tr><td>4. Mediterranean</td><td><tt>-w -a</tt></td><td>Land&ndash;sea H<sub>2</sub>O gradient; coastal DDV; stable O<sub>3</sub></td></tr>
+<tr><td>5. Sweden winter</td><td><tt>-z</tt></td><td>Polar O<sub>3</sub> enhancement at SZA=78&deg;; snow = no DDV; very dry</td></tr>
+<tr><td>6. Yukon summer</td><td><tt>-z -w -a dem=</tt></td><td>All four: boreal DDV + tundra WVC gradient + variable O<sub>3</sub> + elevation</td></tr>
+</table>
+
 <h3>1. Saharan dust storm (desert, tropical atmosphere)</h3>
 
 <p>
@@ -750,7 +761,7 @@ i.hyper.atcorr \
     h2o=1.5,2.5,3.5,4.5 \
     wl_min=0.376 wl_max=2.499 wl_step=0.005
 
-# Per-pixel atmospheric maps + adjacency correction for land-sea boundary
+# Per-pixel atmospheric maps from external products + adjacency correction
 i.hyper.atcorr -u -r \
     input=med_radiance output=med_refl \
     lut=mediterranean.lut \
@@ -760,6 +771,19 @@ i.hyper.atcorr -u -r \
     smooth=2 \
     adj_psf=0.5 \
     uncertainty=med_refl_unc
+
+# Image-based alternative: per-pixel H2O (-w) + DDV AOD (-a) from coastal
+# vegetation replace the external MAIAC and MOD05 maps.
+# -z omitted: Mediterranean O3 (310-320 DU) is stable; scalar reliable.
+i.hyper.atcorr -w -a -u -r \
+    input=med_radiance output=med_refl \
+    lut=med_auto.lut \
+    sza=22 vza=0 raa=0 doy=200 \
+    atmosphere=midsum aerosol=maritime \
+    smooth=2 adj_psf=0.5 \
+    uncertainty=med_refl_unc \
+    aod=0.02,0.06,0.12,0.20,0.30 h2o=1.5,2.5,3.5,4.5 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005
 </pre>
 <p>
 <b>Why adjacency correction matters here</b>: At a land-sea boundary the
@@ -770,6 +794,18 @@ for maritime aerosol at 550 nm) carries the environmental mean reflectance.
 clean marine conditions. Maritime aerosol has low absorption (SSA &asymp; 0.98)
 and coarse sea-salt particles that produce strong forward scattering &mdash; the
 adjacency radius is larger than for fine-mode aerosol at equivalent AOD.
+</p>
+<p>
+<b>Retrieval flags</b>: <tt>-w</tt> retrieves per-pixel WVC from 940 nm;
+the Mediterranean in July has a strong land&ndash;sea H<sub>2</sub>O gradient
+(1.5&ndash;4.0 g/cm&sup2;), which satellite products resolve at only
+5&ndash;10 km &mdash; worse than Tanager&rsquo;s sub-km pixels.
+<tt>-a</tt> exploits coastal garrigue and irrigated farmland as DDV targets;
+the marine AOD horizontal gradient (0.05&ndash;0.20 from open sea to haze
+near the Rh&ocirc;ne delta) is well captured by per-pixel retrieval.
+<tt>-z</tt> is omitted: western Mediterranean mid-summer O<sub>3</sub>
+(~315 DU) varies by &lt; 10 DU between years, within the noise of the
+Chappuis retrieval at moderate SZA.
 </p>
 
 <h3>5. Sub-arctic mid-winter with full ISOFIT pipeline</h3>
@@ -787,6 +823,7 @@ i.hyper.atcorr \
     h2o=0.1,0.3,0.5,0.8 \
     wl_min=0.376 wl_max=2.499 wl_step=0.005
 
+# Full ISOFIT pipeline with external AOD/H2O maps
 i.hyper.atcorr -u -r \
     input=sweden_radiance output=sweden_refl \
     lut=sweden_winter.lut \
@@ -795,6 +832,19 @@ i.hyper.atcorr -u -r \
     aod_map=maiac_aod h2o_map=mod05_wvc \
     smooth=3 adj_psf=1.0 \
     uncertainty=sweden_refl_unc
+
+# Add image-based O3 retrieval (-z): sub-arctic winter O3 varies with polar
+# vortex proximity.  -a and -w not used (snow = no DDV; H2O is well-known).
+i.hyper.atcorr -z -u -r \
+    input=sweden_radiance output=sweden_refl \
+    lut=sweden_winter_auto.lut \
+    sza=78 vza=8 raa=45 doy=15 \
+    atmosphere=subwin aerosol=continental \
+    aod_map=maiac_aod h2o_map=mod05_wvc \
+    smooth=3 adj_psf=1.0 \
+    uncertainty=sweden_refl_unc \
+    aod=0.01,0.05,0.10,0.20 h2o=0.1,0.3,0.5,0.8 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005
 </pre>
 <p>
 <b>Why <tt>atmosphere=subwin</tt></b>: Sub-arctic winter profiles have the
@@ -806,6 +856,20 @@ regularisation is especially useful here: bright snow reflectance is nearly
 spectrally flat (prior: soil component), which constrains physically
 implausible spectral spikes caused by residual gas-correction errors at very
 long atmospheric path lengths.
+</p>
+<p>
+<b>Retrieval flags</b>: <tt>-z</tt> is particularly valuable at high latitudes
+in winter: the polar vortex can push stratospheric O<sub>3</sub> columns to
+350&ndash;400 DU (vs the 340 DU prior), and the long path length at SZA=78&deg;
+amplifies O<sub>3</sub> absorption by ~&times;5 relative to nadir &mdash; a
+40 DU offset causes a ~1&nbsp;% error in the green&ndash;red bands. Retrieving
+O<sub>3</sub> from the Chappuis band eliminates this latitude-dependent offset
+without requiring a real-time O<sub>3</sub> product. <tt>-a</tt> is omitted:
+snow in January has &rho;<sub>2130</sub> &gt; 0.25, excluding virtually all
+land pixels from the DDV mask. <tt>-w</tt> is omitted: sub-arctic winter WVC
+(&lt; 0.5 g/cm&sup2;) is well-captured by the narrow H<sub>2</sub>O LUT
+grid; the external MOD05 map is preferred over the noisier 940 nm retrieval in
+very cold, dry conditions.
 </p>
 
 <h3>6. Sub-arctic mid-summer &mdash; boreal forest</h3>
@@ -823,12 +887,27 @@ i.hyper.atcorr \
     h2o=0.8,1.5,2.5,3.5 \
     wl_min=0.376 wl_max=2.499 wl_step=0.005
 
+# Correction with scalar state (scalar baseline)
 i.hyper.atcorr \
     input=yukon_radiance output=yukon_refl \
     lut=yukon_summer.lut \
     sza=45 vza=2 raa=60 doy=190 \
     aod_val=0.08 h2o_val=2.0 \
     atmosphere=subsum aerosol=continental
+
+# Fully standalone: all four atmospheric state variables from the image.
+# -z: O3 varies 300-340 DU with planetary wave activity.
+# -w: tundra WVC spans 1-3.5 g/cm2; per-pixel retrieval captures the gradient.
+# -a: dense boreal spruce forest is an ideal DDV target (NDVI ~0.6-0.8).
+# dem=: Yukon terrain spans 500-2000+ m; ISA pressure correction is significant.
+i.hyper.atcorr -z -w -a \
+    input=yukon_radiance output=yukon_refl \
+    lut=yukon_summer_auto.lut \
+    sza=45 vza=2 raa=60 doy=190 \
+    atmosphere=subsum aerosol=continental \
+    dem=dem_yukon \
+    aod=0.02,0.07,0.15,0.30 h2o=0.8,1.5,2.5,3.5 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005
 </pre>
 <p>
 <b>Why <tt>atmosphere=subsum</tt></b>: Sub-arctic summer combines moderate
@@ -836,6 +915,18 @@ surface temperatures with relatively dry air (H<sub>2</sub>O &lt; 3.5 g/cm&sup2;
 a profile distinct from both the tropical and mid-latitude summer models.
 The boreal growing season produces biogenic terpene aerosol well captured by
 the continental aerosol model.
+</p>
+<p>
+<b>Retrieval flags</b>: <tt>-z</tt> retrieves scene-mean O<sub>3</sub>;
+sub-arctic summer O<sub>3</sub> varies 300&ndash;340 DU with planetary wave
+activity. <tt>-w</tt> retrieves per-pixel WVC from the 940 nm band; boreal&ndash;
+tundra landscapes have WVC gradients of 1&ndash;2 g/cm&sup2; over 10&ndash;20 km
+(wet valley bogs vs dry ridgelines). <tt>-a</tt> uses dense spruce forest as
+a DDV target (&rho;<sub>2130</sub> &asymp; 0.05&ndash;0.12, NDVI ~0.6&ndash;0.8);
+wildfire smoke episodically raises AOD from background ~0.05 to &gt; 0.5.
+<tt>dem=</tt> applies the ISA barometric formula to the mean terrain elevation;
+a 1&thinsp;000 m elevation change reduces surface pressure by ~11&nbsp;%,
+which if uncorrected biases Rayleigh scattering by ~3&nbsp;% in the blue bands.
 </p>
 
 <h3>7. Custom Mie aerosol + BRDF via the C API (Python)</h3>
@@ -910,6 +1001,71 @@ i.hyper.atcorr --verbose \
     aod=0.0,0.2,0.4 h2o=2.0,4.0 \
     wl_min=0.4 wl_max=2.5 wl_step=0.05
 </pre>
+
+<h3>9. Fully standalone &mdash; all atmospheric state from the image</h3>
+
+<p>
+This example demonstrates the autonomous mode where all four atmospheric state
+variables are retrieved from the hyperspectral image itself, eliminating the
+need for external ancillary products (MODIS O<sub>3</sub>, MOD05 WVC, MAIAC
+AOD, or a DEM pressure lookup). A single command generates the LUT and applies
+the correction.
+</p>
+<pre>
+# All four image-based retrievals in one pass:
+#   -z  -&gt; scene-mean O3 from Chappuis band (540/600/680 nm)
+#   -w  -&gt; per-pixel WVC from 940 nm band depth (865/940/1040 nm)
+#   -a  -&gt; per-pixel AOD from MODIS DDV algorithm (470/660/860/2130 nm)
+#   dem= -&gt; ISA surface pressure from mean DEM elevation
+i.hyper.atcorr -z -w -a \
+    input=scene_radiance output=scene_refl \
+    lut=scene_auto.lut \
+    sza=40 vza=3 raa=120 doy=180 \
+    atmosphere=midsum aerosol=continental \
+    dem=terrain_dem \
+    aod=0.0,0.05,0.1,0.2,0.4,0.8 \
+    h2o=0.5,1.5,3.0,5.0 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005
+</pre>
+<p><b>What each flag retrieves</b>:</p>
+<dl>
+<dt><tt>-z</tt></dt>
+<dd>Scene-mean O<sub>3</sub> (Dobson units) from the Chappuis absorption band
+centred at 600 nm. Continuum: linear interpolation of L<sub>540</sub> and
+L<sub>680</sub>; band depth D = 1 &minus; L<sub>600</sub>/L<sub>cont</sub>;
+O<sub>3</sub> = D / (&sigma;<sub>600</sub> &times; m) where
+&sigma;<sub>600</sub> &asymp; 10<sup>&minus;4</sup> DU<sup>&minus;1</sup> and
+m = 1/cos(SZA) + 1/cos(VZA). Replaces <tt>ozone=</tt> before the LUT is
+computed; falls back to 300 DU if no valid pixels are found.</dd>
+
+<dt><tt>-w</tt></dt>
+<dd>Per-pixel column water vapour (g/cm&sup2;) from the 940 nm band depth.
+Continuum: linear interpolation of L<sub>865</sub> and L<sub>1040</sub>;
+D = 1 &minus; L<sub>940</sub>/L<sub>cont</sub>;
+WVC = D / (K<sub>940</sub> &times; m) where K<sub>940</sub> = 0.036 cm&sup2;/g.
+The per-pixel array replaces the scalar <tt>h2o_val=</tt> during correction;
+pixels without valid 940 nm signal fall back to 2 g/cm&sup2;.</dd>
+
+<dt><tt>-a</tt></dt>
+<dd>Per-pixel AOD at 550 nm from the MODIS DDV algorithm. DDV mask:
+0.01 &lt; &rho;<sub>2130</sub> &lt; 0.25 AND NDVI(860/660) &gt; 0.1.
+Surface reflectance predicted as &rho;<sub>surf,470</sub> = 0.25 &rho;<sub>2130</sub>
+and &rho;<sub>surf,660</sub> = 0.50 &rho;<sub>2130</sub>. &Aring;ngstr&ouml;m
+exponent from the 470/660 nm pair scales &tau; to 550 nm. Non-DDV pixels
+receive the scene-mean AOD. Requires bands near 470, 660, 860, and 2130 nm.</dd>
+
+<dt><tt>dem=</tt></dt>
+<dd>Mean terrain elevation &rarr; ISA surface pressure
+P = 1013.25 &times; (1 &minus; 2.2558 &times; 10<sup>&minus;5</sup> &times; h)<sup>5.2559</sup> hPa.
+Updates <tt>surface_pressure</tt> before LUT computation. Eliminates the
+systematic Rayleigh scattering bias at elevations above ~500 m.</dd>
+</dl>
+<p>
+<b>Prerequisites</b>: the image must span at least 376&ndash;2499 nm with
+adequate SNR at 540/600/680 nm (O<sub>3</sub>), 865/940/1040 nm (H<sub>2</sub>O),
+and 470/660/860/2130 nm (AOD). Tanager, DESIS, HySpex, PRISMA, and EnMAP all
+satisfy these requirements.
+</p>
 
 <h2>SEE ALSO</h2>
 <em>
