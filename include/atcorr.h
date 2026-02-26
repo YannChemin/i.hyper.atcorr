@@ -99,6 +99,21 @@ static inline float atcorr_invert(float rho_toa, float R_atm,
     return y / (1.0f + s_alb * y + 1e-10f);
 }
 
+/* BRDF-coupled inversion (6SV idirec=1 equivalent).
+ *
+ * rho_albe: bihemispherical (white-sky) albedo of the BRDF surface,
+ *           from sixs_brdf_albe().  Used for the s_alb coupling denominator
+ *           in place of the directional ρ_boa used by the Lambertian formula.
+ *
+ * Returns the bidirectional reflectance factor ρ_brdf(θs,θv,φ). */
+static inline float atcorr_invert_brdf(float rho_toa, float R_atm,
+                                        float T_down,  float T_up,
+                                        float s_alb,   float rho_albe)
+{
+    float y = (rho_toa - R_atm) / (T_down * T_up + 1e-10f);
+    return y * (1.0f - s_alb * rho_albe);
+}
+
 /* ─── Solar irradiance and Earth-Sun distance ─────────────────────────────── */
 
 /* Solar irradiance E0 in W/(m² µm) at wl_um, from 6SV2.1 Thuillier spectrum.

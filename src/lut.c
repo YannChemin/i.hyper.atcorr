@@ -105,18 +105,6 @@ int atcorr_compute_lut(const LutConfig *cfg, LutArrays *out)
 
         sixs_aerosol_init(ctx, cfg->aerosol_model, aod, xmud);
 
-        /* BRDF pre-computation: for non-Lambertian surfaces, evaluate the
-         * surface bidirectional reflectance at the scene geometry.
-         * Currently stored as a per-AOD scalar (geometry-only, no wavelength
-         * dependence at this stage); full igroun=1 coupling into DISCOM
-         * is deferred to a future implementation pass. */
-        float rho_brdf = 0.0f;
-        if (cfg->brdf_type != BRDF_LAMBERTIAN) {
-            rho_brdf = sixs_brdf_eval(cfg->brdf_type, &cfg->brdf_params,
-                                       xmus, xmuv, cfg->raa);
-        }
-        (void)rho_brdf;   /* stored; RT injection deferred */
-
         /* Call DISCOM once per AOD: fills ctx->disc at 20 reference wavelengths */
         float taer55p = aod;   /* satellite: no aerosol above */
         if (cfg->altitude_km <= 900.0f) taer55p = 0.0f;

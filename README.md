@@ -221,6 +221,33 @@ Runs with:
 - Surface prior MAP regularisation
 - Uncertainty output in `tanager_refl_unc`
 
+### Fully standalone — all atmospheric state from the image
+
+No external ancillary products required.  A single command retrieves O₃,
+per-pixel H₂O, per-pixel AOD, and surface pressure from the image, then
+generates the LUT and applies the correction.
+
+```sh
+i.hyper.atcorr -z -w -a \
+    input=tanager_radiance output=tanager_refl \
+    lut=tanager_auto.lut \
+    sza=35.2 vza=4.1 raa=97 doy=45 \
+    atmosphere=midsum aerosol=continental \
+    dem=srtm_dem \
+    aod=0.0,0.05,0.1,0.2,0.4,0.8 \
+    h2o=0.5,1.5,3.0,5.0 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005
+```
+
+- **`-z`** retrieves scene-mean O₃ (DU) from Chappuis absorption at 600 nm;
+  replaces `ozone=` before the LUT is computed
+- **`-w`** retrieves per-pixel WVC (g/cm²) from the 940 nm band depth
+  (continuum from 865/1040 nm shoulders); used in place of `h2o_val=`
+- **`-a`** retrieves per-pixel AOD at 550 nm from the MODIS DDV algorithm
+  (470/660/860/2130 nm); non-DDV pixels receive the scene-mean AOD
+- **`dem=`** computes ISA surface pressure from the mean DEM elevation and
+  updates the LUT configuration before computation
+
 ---
 
 ## Options Reference
@@ -280,6 +307,20 @@ Runs with:
 | `-r` | off | Surface prior MAP regularisation (#3/#5/#6) |
 | `-u` | off | Compute per-band uncertainty (#4) |
 | `uncertainty=` | — | Output uncertainty Raster3D (#4) |
+
+### Image-based Retrieval
+
+These flags retrieve atmospheric state directly from the input radiance cube,
+eliminating the need for co-located ancillary products.  `-z` and `dem=`
+update the LUT configuration before it is computed; `-w` and `-a` provide
+per-pixel arrays used during the correction step.
+
+| Option / Flag | Description |
+|---------------|-------------|
+| `-z` | Retrieve scene-mean O₃ (DU) from Chappuis band depth at 600 nm; requires bands near 540, 600, 680 nm |
+| `-w` | Retrieve per-pixel WVC (g/cm²) from 940 nm band depth; requires bands near 865, 940, 1040 nm |
+| `-a` | Retrieve per-pixel AOD at 550 nm from MODIS DDV algorithm; requires bands near 470, 660, 860, 2130 nm |
+| `dem=` | ISA surface pressure from mean elevation of a DEM raster; replaces default 1013.25 hPa |
 
 ---
 

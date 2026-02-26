@@ -51,6 +51,7 @@
 #include "include/adjacency.h"
 #include "include/surface_model.h"
 #include "include/uncertainty.h"
+#include "include/retrieve.h"
 
 #define LUT_MAGIC   0x4C555400u
 #define LUT_VERSION 1u
@@ -61,6 +62,8 @@ typedef struct {
     /* #1 Per-pixel atmospheric maps + smoothing */
     const char *aod_map;      /* 2-D raster name, or NULL for scalar */
     const char *h2o_map;      /* 2-D raster name, or NULL for scalar */
+    float      *aod_data;     /* pre-computed AOD [nrows*ncols], or NULL (overrides aod_map) */
+    float      *h2o_data;     /* pre-computed H2O [nrows*ncols], or NULL (overrides h2o_map) */
     float       smooth_sigma; /* Gaussian σ in pixels (0 = disabled) */
 
     /* #2 Adjacency correction */
@@ -216,6 +219,46 @@ static void write_band_to_rast3d(RASTER3D_Map *outmap,
     }
 }
 
+/* ── Find band index closest to target wavelength (µm) ─────────────────────── */
+
+static int find_closest_band(const float *wl, int n, float target)
+{
+    int   best = 0;
+    float bd   = fabsf(wl[0] - target);
+    for (int i = 1; i < n; i++) {
+        float d = fabsf(wl[i] - target);
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+/* ── Load multiple depth slices from an open Raster3D map ──────────────────── *
+ * depths[nb]: band depth indices to load.
+ * bufs[nb]:   pre-allocated float[nrows*ncols] output buffers.
+ * Invalid / null values → NaN. */
+
+static void load_bands_from_cube(RASTER3D_Map *map,
+                                  const int *depths, int nb,
+                                  int nrows, int ncols,
+                                  float **bufs)
+{
+    int npix = nrows * ncols;
+    for (int b = 0; b < nb; b++)
+        for (int i = 0; i < npix; i++)
+            bufs[b][i] = NAN;
+    if (!map) return;
+
+    for (int b = 0; b < nb; b++) {
+        int z = depths[b];
+        for (int r = 0; r < nrows; r++)
+            for (int c = 0; c < ncols; c++) {
+                DCELL v = Rast3d_get_double(map, c, r, z);
+                bufs[b][r * ncols + c] =
+                    (Rast_is_d_null_value(&v) || v <= 0.0) ? NAN : (float)v;
+            }
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * correct_raster3d — full correction pipeline with ISOFIT improvements
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -303,13 +346,22 @@ static void correct_raster3d(const char *input_name, const char *output_name,
                       n_out, cfg->wl[0], cfg->wl[cfg->n_wl-1]);
     }
 
-    /* ── #1: Load and optionally smooth per-pixel AOD/H2O maps ── */
+    /* ── #1: Load and optionally smooth per-pixel AOD/H2O maps ── *
+     * Pre-loaded retrieval arrays (iso->aod_data / iso->h2o_data) take
+     * priority over raster map names (iso->aod_map / iso->h2o_map).
+     * free_aod_map / free_h2o_map track ownership for cleanup. */
     float *aod_map_data = NULL;
     float *h2o_map_data = NULL;
     int    have_aod_map = 0;
     int    have_h2o_map = 0;
+    int    free_aod_map = 0;
+    int    free_h2o_map = 0;
 
-    if (iso && iso->aod_map && iso->aod_map[0]) {
+    if (iso && iso->aod_data) {
+        aod_map_data = iso->aod_data;
+        have_aod_map = 1;
+        G_verbose_message(_("Using pre-retrieved per-pixel AOD"));
+    } else if (iso && iso->aod_map && iso->aod_map[0]) {
         G_message(_("Loading per-pixel AOD map <%s>..."), iso->aod_map);
         aod_map_data = load_raster2d(iso->aod_map, nrows, ncols, aod_val);
         /* Clamp to valid AOD range */
@@ -323,9 +375,14 @@ static void correct_raster3d(const char *input_name, const char *output_name,
             spatial_gaussian_filter(aod_map_data, nrows, ncols, iso->smooth_sigma);
         }
         have_aod_map = 1;
+        free_aod_map = 1;
     }
 
-    if (iso && iso->h2o_map && iso->h2o_map[0]) {
+    if (iso && iso->h2o_data) {
+        h2o_map_data = iso->h2o_data;
+        have_h2o_map = 1;
+        G_verbose_message(_("Using pre-retrieved per-pixel H2O"));
+    } else if (iso && iso->h2o_map && iso->h2o_map[0]) {
         G_message(_("Loading per-pixel H2O map <%s>..."), iso->h2o_map);
         h2o_map_data = load_raster2d(iso->h2o_map, nrows, ncols, h2o_val);
         for (int i = 0; i < npix; i++) {
@@ -338,6 +395,7 @@ static void correct_raster3d(const char *input_name, const char *output_name,
             spatial_gaussian_filter(h2o_map_data, nrows, ncols, iso->smooth_sigma);
         }
         have_h2o_map = 1;
+        free_h2o_map = 1;
     }
 
     int use_per_pixel = have_aod_map || have_h2o_map;
@@ -430,6 +488,14 @@ static void correct_raster3d(const char *input_name, const char *output_name,
         G_free(wl_bands);
     }
 
+    /* ── BRDF white-sky albedo for the s_alb coupling ── */
+    /* Computed once per scene: BrdfParams are spectrally uniform scalars. */
+    float rho_albe_brdf = 0.0f;
+    if (cfg->brdf_type != BRDF_LAMBERTIAN)
+        rho_albe_brdf = sixs_brdf_albe(cfg->brdf_type, &cfg->brdf_params,
+                                        cos_szaf, 48, 24);
+    const int use_brdf = (cfg->brdf_type != BRDF_LAMBERTIAN);
+
     /* ── Correction loop: band by band ── */
     G_message(_("Correcting %d bands × %d rows × %d cols..."),
               ndepths, nrows, ncols);
@@ -472,7 +538,9 @@ static void correct_raster3d(const char *input_name, const char *output_name,
                                          &R_a, &T_d, &T_u, &s_a);
 
                 float rho_toa = (float)(M_PI * L * d2) / (E0 * cos_szaf);
-                refl_band[i]  = atcorr_invert(rho_toa, R_a, T_d, T_u, s_a);
+                refl_band[i]  = use_brdf
+                    ? atcorr_invert_brdf(rho_toa, R_a, T_d, T_u, s_a, rho_albe_brdf)
+                    : atcorr_invert(rho_toa, R_a, T_d, T_u, s_a);
             }
         } else {
             /* Scalar correction (original path) */
@@ -483,7 +551,9 @@ static void correct_raster3d(const char *input_name, const char *output_name,
                 float L = rad_band[i];
                 if (!isfinite(L) || E0 <= 0.0f) { refl_band[i] = NAN; continue; }
                 float rho_toa = (float)(M_PI * L * d2) / (E0 * cos_szaf);
-                refl_band[i]  = atcorr_invert(rho_toa, R_a_s, T_d_s, T_u_s, s_a_s);
+                refl_band[i]  = use_brdf
+                    ? atcorr_invert_brdf(rho_toa, R_a_s, T_d_s, T_u_s, s_a_s, rho_albe_brdf)
+                    : atcorr_invert(rho_toa, R_a_s, T_d_s, T_u_s, s_a_s);
             }
         }
 
@@ -606,8 +676,8 @@ static void correct_raster3d(const char *input_name, const char *output_name,
     G_free(rad_band);   G_free(refl_band);
     G_free(sigma_band);
     G_free(refl_cube);  G_free(sigma_cube);
-    G_free(aod_map_data);
-    G_free(h2o_map_data);
+    if (free_aod_map) G_free(aod_map_data);
+    if (free_h2o_map) G_free(h2o_map_data);
     G_free(sigma_model);
     surface_model_free(surf_mdl);
 
@@ -701,6 +771,35 @@ int main(int argc, char *argv[])
     opt_ozone->required = NO; opt_ozone->answer = "300";
     opt_ozone->description = _("Total ozone column (Dobson units)");
     opt_ozone->guisection = _("Atmosphere");
+
+    /* ── Surface BRDF ── */
+    struct Option *opt_brdf = G_define_option();
+    opt_brdf->key         = "brdf";
+    opt_brdf->type        = TYPE_STRING;
+    opt_brdf->required    = NO;
+    opt_brdf->answer      = "lambertian";
+    opt_brdf->options     = "lambertian,rahman,roujean,hapke,ocean,"
+                            "walthall,minnaert,rosslimaignan";
+    opt_brdf->description = _("Surface BRDF model for non-Lambertian correction");
+    opt_brdf->guisection  = _("Surface");
+
+    struct Option *opt_brdf_params = G_define_option();
+    opt_brdf_params->key         = "brdf_params";
+    opt_brdf_params->type        = TYPE_STRING;
+    opt_brdf_params->required    = NO;
+    opt_brdf_params->answer      = NULL;
+    opt_brdf_params->label       = _("BRDF model parameters (comma-separated floats)");
+    opt_brdf_params->description =
+        _("Up to 5 comma-separated floats for the chosen BRDF model:\n"
+          "  lambertian: rho0\n"
+          "  rahman:     rho0, af, k\n"
+          "  roujean:    k0, k1, k2\n"
+          "  hapke:      om, af, s0, h\n"
+          "  ocean:      wspd_ms, azw_deg, sal_ppt, pcl_mgl, wl_um\n"
+          "  walthall:   a, ap, b, c\n"
+          "  minnaert:   k, b\n"
+          "  rosslimaignan: f_iso, f_vol, f_geo");
+    opt_brdf_params->guisection  = _("Surface");
 
     /* ── LUT grid ── */
     struct Option *opt_aod = G_define_option();
@@ -819,6 +918,47 @@ int main(int argc, char *argv[])
           "memory. Uses per-band model discrepancy as uncertainty floor (#6).");
     flag_r->guisection = _("ISOFIT");
 
+    /* ── Image-based retrieval flags ── */
+    struct Flag *flag_a = G_define_flag();
+    flag_a->key = 'a';
+    flag_a->label = _("Retrieve AOD from Dark Dense Vegetation (DDV)");
+    flag_a->description =
+        _("Estimates per-pixel AOD at 550 nm from dark vegetated pixels "
+          "(MODIS dark-target: 470/660/860/2130 nm bands). "
+          "Updates aod_val= and provides a per-pixel AOD map. "
+          "Requires input= with wavelength metadata.");
+    flag_a->guisection = _("Retrieval");
+
+    struct Flag *flag_w = G_define_flag();
+    flag_w->key = 'w';
+    flag_w->label = _("Retrieve column water vapour from 940 nm absorption");
+    flag_w->description =
+        _("Estimates per-pixel WVC [g/cm²] from the 940 nm band depth "
+          "(continuum interpolation: 865/940/1040 nm). "
+          "Provides a per-pixel H2O map for correction. "
+          "Requires input= with wavelength metadata.");
+    flag_w->guisection = _("Retrieval");
+
+    struct Flag *flag_z = G_define_flag();
+    flag_z->key = 'z';
+    flag_z->label = _("Retrieve O3 column from Chappuis absorption");
+    flag_z->description =
+        _("Estimates scene-mean ozone [DU] from 600 nm band depth "
+          "(continuum: 540/600/680 nm). "
+          "Updates the ozone= value used in LUT computation. "
+          "Requires input= with wavelength metadata.");
+    flag_z->guisection = _("Retrieval");
+
+    struct Option *opt_dem = G_define_standard_option(G_OPT_R_INPUT);
+    opt_dem->key      = "dem";
+    opt_dem->required = NO;
+    opt_dem->label    = _("DEM raster for surface pressure retrieval");
+    opt_dem->description =
+        _("2-D elevation raster [m above sea level]. "
+          "Scene-mean elevation → ISA pressure, overriding standard-atmosphere "
+          "sea-level pressure in LUT computation.");
+    opt_dem->guisection = _("Retrieval");
+
     if (G_parser(argc, argv))
         exit(EXIT_FAILURE);
 
@@ -831,6 +971,8 @@ int main(int argc, char *argv[])
         G_warning(_("uncertainty= output ignored without -u flag"));
     if (flag_u->answer && !opt_output->answer)
         G_fatal_error(_("-u requires output= (needs correction to run first)"));
+    if ((flag_a->answer || flag_w->answer || flag_z->answer) && !opt_input->answer)
+        G_fatal_error(_("Flags -a, -w, -z require input="));
 
     /* ── Parse scalar parameters ── */
     float sza      = (float)atof(opt_sza->answer);
@@ -871,6 +1013,36 @@ int main(int argc, char *argv[])
     else if (!strcmp(opt_aerosol->answer, "desert"))      aerosol_model = AEROSOL_DESERT;
     else G_fatal_error(_("Unknown aerosol model: %s"), opt_aerosol->answer);
 
+    /* BRDF type */
+    static const struct { const char *name; BrdfType val; } brdf_map[] = {
+        {"lambertian",    BRDF_LAMBERTIAN},  {"rahman",       BRDF_RAHMAN},
+        {"roujean",       BRDF_ROUJEAN},     {"hapke",        BRDF_HAPKE},
+        {"ocean",         BRDF_OCEAN},       {"walthall",     BRDF_WALTHALL},
+        {"minnaert",      BRDF_MINNAERT},    {"rosslimaignan",BRDF_ROSSLIMAIGNAN},
+        {NULL, 0}
+    };
+    BrdfType brdf_type = BRDF_LAMBERTIAN;
+    for (int bi = 0; brdf_map[bi].name; bi++)
+        if (strcmp(opt_brdf->answer, brdf_map[bi].name) == 0)
+            { brdf_type = brdf_map[bi].val; break; }
+
+    /* BRDF params: parse up to 5 comma-separated floats into the union */
+    BrdfParams brdf_params;
+    memset(&brdf_params, 0, sizeof(brdf_params));
+    brdf_params.lambertian.rho0 = 1.0f;   /* safe default */
+    if (opt_brdf_params->answer) {
+        float pv[5] = {0};
+        int np = 0;
+        char *s = G_store(opt_brdf_params->answer), *tok;
+        tok = strtok(s, ",");
+        while (tok && np < 5) {
+            pv[np++] = (float)atof(tok);
+            tok = strtok(NULL, ",");
+        }
+        G_free(s);
+        memcpy(&brdf_params, pv, (size_t)np * sizeof(float));
+    }
+
     float aod_buf[64]; int n_aod = parse_csv_floats(opt_aod->answer, aod_buf, 64);
     if (n_aod <= 0) G_fatal_error(_("Cannot parse aod= values"));
 
@@ -893,7 +1065,162 @@ int main(int argc, char *argv[])
         .altitude_km = altitude,
         .atmo_model = atmo_model, .aerosol_model = aerosol_model,
         .surface_pressure = 0.0f, .ozone_du = ozone,
+        .brdf_type = brdf_type, .brdf_params = brdf_params,
     };
+
+    /* ── Image-based atmospheric state retrievals ── *
+     * Performed before atcorr_compute_lut() so that O3 and surface pressure
+     * updates flow into the LUT.  AOD and H2O per-pixel maps are stored and
+     * passed to correct_raster3d() via IsoFitParams.aod_data / .h2o_data. */
+    float *retrieved_aod = NULL;
+    float *retrieved_h2o = NULL;
+
+    if (opt_input->answer &&
+        (flag_a->answer || flag_w->answer || flag_z->answer)) {
+
+        /* Open the input cube to get exact dims and band wavelengths */
+        const char *ret_mapset = G_find_raster3d(opt_input->answer, "");
+        if (!ret_mapset)
+            G_fatal_error(_("Cannot find input cube <%s> for retrieval"),
+                          opt_input->answer);
+
+        RASTER3D_Region ret_reg;
+        Rast3d_get_window(&ret_reg);
+        RASTER3D_Map *ret_map = Rast3d_open_cell_old(
+            opt_input->answer, ret_mapset, &ret_reg,
+            RASTER3D_TILE_SAME_AS_FILE, RASTER3D_USE_CACHE_DEFAULT);
+        if (!ret_map)
+            G_fatal_error(_("Cannot open input cube <%s> for retrieval"),
+                          opt_input->answer);
+        Rast3d_get_region_struct_map(ret_map, &ret_reg);
+
+        int ret_nrows  = ret_reg.rows;
+        int ret_ncols  = ret_reg.cols;
+        int ret_nbands = ret_reg.depths;
+        int ret_npix   = ret_nrows * ret_ncols;
+
+        /* Parse band wavelengths from r3.info metadata */
+        float *cube_wl    = G_malloc(ret_nbands * sizeof(float));
+        float *cube_fwhm  = G_malloc(ret_nbands * sizeof(float));
+        int    n_wl_parsed = parse_band_wl(opt_input->answer, cube_wl,
+                                            cube_fwhm, ret_nbands);
+        G_free(cube_fwhm);
+        if (n_wl_parsed == 0) {
+            G_warning(_("No wavelength metadata in <%s>; retrieval may be inaccurate"),
+                      opt_input->answer);
+            for (int b = 0; b < ret_nbands && b < n_wl; b++)
+                cube_wl[b] = wl_buf[b];
+        }
+
+        /* ── O3 from Chappuis band (updates cfg.ozone_du) ── */
+        if (flag_z->answer) {
+            int b540 = find_closest_band(cube_wl, ret_nbands, 0.540f);
+            int b600 = find_closest_band(cube_wl, ret_nbands, 0.600f);
+            int b680 = find_closest_band(cube_wl, ret_nbands, 0.680f);
+            G_message(_("Retrieving O3 from bands %.0f/%.0f/%.0f nm..."),
+                      cube_wl[b540]*1000.0f, cube_wl[b600]*1000.0f,
+                      cube_wl[b680]*1000.0f);
+
+            float *L_540 = G_malloc(ret_npix * sizeof(float));
+            float *L_600 = G_malloc(ret_npix * sizeof(float));
+            float *L_680 = G_malloc(ret_npix * sizeof(float));
+            int depths_o3[3]  = {b540, b600, b680};
+            float *ptrs_o3[3] = {L_540, L_600, L_680};
+            load_bands_from_cube(ret_map, depths_o3, 3,
+                                 ret_nrows, ret_ncols, ptrs_o3);
+
+            float o3_du = retrieve_o3_chappuis(L_540, L_600, L_680,
+                                                ret_npix, sza, vza);
+            G_free(L_540); G_free(L_600); G_free(L_680);
+            G_message(_("O3 retrieved: %.1f DU (scene mean, Chappuis band)"),
+                      o3_du);
+            cfg.ozone_du = o3_du;
+        }
+
+        /* ── H2O per-pixel from 940 nm ── */
+        if (flag_w->answer) {
+            int b865  = find_closest_band(cube_wl, ret_nbands, 0.865f);
+            int b940  = find_closest_band(cube_wl, ret_nbands, 0.940f);
+            int b1040 = find_closest_band(cube_wl, ret_nbands, 1.040f);
+            G_message(_("Retrieving H2O from bands %.0f/%.0f/%.0f nm..."),
+                      cube_wl[b865]*1000.0f, cube_wl[b940]*1000.0f,
+                      cube_wl[b1040]*1000.0f);
+
+            float *L_865  = G_malloc(ret_npix * sizeof(float));
+            float *L_940  = G_malloc(ret_npix * sizeof(float));
+            float *L_1040 = G_malloc(ret_npix * sizeof(float));
+            int depths_h2o[3]  = {b865, b940, b1040};
+            float *ptrs_h2o[3] = {L_865, L_940, L_1040};
+            load_bands_from_cube(ret_map, depths_h2o, 3,
+                                 ret_nrows, ret_ncols, ptrs_h2o);
+
+            retrieved_h2o = G_malloc(ret_npix * sizeof(float));
+            retrieve_h2o_940(L_865, L_940, L_1040,
+                              ret_npix, sza, vza, retrieved_h2o);
+            G_free(L_865); G_free(L_940); G_free(L_1040);
+
+            /* Update scalar h2o_val with the scene mean */
+            double h2o_sum = 0.0; int h2o_n = 0;
+            for (int i = 0; i < ret_npix; i++)
+                if (isfinite(retrieved_h2o[i])) { h2o_sum += retrieved_h2o[i]; h2o_n++; }
+            if (h2o_n > 0) {
+                h2o_val = (float)(h2o_sum / h2o_n);
+                G_message(_("H2O retrieved: %.2f g/cm² scene mean"), h2o_val);
+            }
+        }
+
+        /* ── AOD per-pixel from DDV ── */
+        if (flag_a->answer) {
+            int b470  = find_closest_band(cube_wl, ret_nbands, 0.470f);
+            int b660  = find_closest_band(cube_wl, ret_nbands, 0.660f);
+            int b860  = find_closest_band(cube_wl, ret_nbands, 0.860f);
+            int b2130 = find_closest_band(cube_wl, ret_nbands, 2.130f);
+            G_message(_("Retrieving AOD (DDV) from bands %.0f/%.0f/%.0f/%.0f nm..."),
+                      cube_wl[b470]*1000.0f,  cube_wl[b660]*1000.0f,
+                      cube_wl[b860]*1000.0f,  cube_wl[b2130]*1000.0f);
+
+            float *L_470  = G_malloc(ret_npix * sizeof(float));
+            float *L_660  = G_malloc(ret_npix * sizeof(float));
+            float *L_860  = G_malloc(ret_npix * sizeof(float));
+            float *L_2130 = G_malloc(ret_npix * sizeof(float));
+            int depths_aod[4]  = {b470, b660, b860, b2130};
+            float *ptrs_aod[4] = {L_470, L_660, L_860, L_2130};
+            load_bands_from_cube(ret_map, depths_aod, 4,
+                                 ret_nrows, ret_ncols, ptrs_aod);
+
+            retrieved_aod = G_malloc(ret_npix * sizeof(float));
+            float aod_mean = retrieve_aod_ddv(L_470, L_660, L_860, L_2130,
+                                               ret_npix, doy, sza, retrieved_aod);
+            G_free(L_470); G_free(L_660); G_free(L_860); G_free(L_2130);
+            aod_val = aod_mean;
+            G_message(_("AOD retrieved (DDV): %.3f scene mean at 550 nm"), aod_mean);
+        }
+
+        Rast3d_close(ret_map);
+        G_free(cube_wl);
+    }
+
+    /* ── Surface pressure from DEM ── */
+    if (opt_dem->answer) {
+        struct Cell_head win2d;
+        G_get_window(&win2d);
+        int dem_nrows = win2d.rows, dem_ncols = win2d.cols;
+        float *dem_data = load_raster2d(opt_dem->answer,
+                                         dem_nrows, dem_ncols, 0.0f);
+        double sum_elev = 0.0; int n_elev = 0;
+        for (int i = 0; i < dem_nrows * dem_ncols; i++)
+            if (isfinite(dem_data[i])) { sum_elev += dem_data[i]; n_elev++; }
+        G_free(dem_data);
+        if (n_elev > 0) {
+            float mean_elev = (float)(sum_elev / n_elev);
+            cfg.surface_pressure = retrieve_pressure_isa(mean_elev);
+            G_message(_("Surface pressure from DEM: %.1f hPa (mean elev %.0f m)"),
+                      cfg.surface_pressure, mean_elev);
+        } else {
+            G_warning(_("DEM <%s> has no valid pixels; using standard atmosphere"),
+                      opt_dem->answer);
+        }
+    }
 
     size_t n      = (size_t)n_aod * n_h2o * n_wl;
     float *R_atm  = G_malloc(n * sizeof(float));
@@ -975,6 +1302,8 @@ int main(int argc, char *argv[])
         IsoFitParams iso = {
             .aod_map        = opt_aod_map->answer,
             .h2o_map        = opt_h2o_map->answer,
+            .aod_data       = retrieved_aod,   /* pre-retrieved per-pixel AOD */
+            .h2o_data       = retrieved_h2o,   /* pre-retrieved per-pixel H2O */
             .smooth_sigma   = (float)atof(opt_smooth->answer),
             .adj_psf_km     = adj,
             .pixel_size_m   = (float)atof(opt_pixel_size->answer),
@@ -988,6 +1317,8 @@ int main(int argc, char *argv[])
                          &cfg, &lut, aod_val, h2o_val, doy, sza, &iso);
     }
 
+    G_free(retrieved_aod);
+    G_free(retrieved_h2o);
     G_free(wl_buf);
     G_free(R_atm); G_free(T_down); G_free(T_up); G_free(s_alb);
 
