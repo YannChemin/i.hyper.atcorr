@@ -42,7 +42,8 @@ static float log_interp(float y_inf, float y_sup,
 void sixs_interp(const SixsCtx *ctx, int iaer, float wl,
                   float taer55, float taer55p,
                   float *roatm, float *T_down, float *T_up, float *s_alb,
-                  float *tray_out, float *taer_out)
+                  float *tray_out, float *taer_out,
+                  float *T_down_dir_out)
 {
     const SixsDisc *d = &ctx->disc;
 
@@ -122,5 +123,43 @@ void sixs_interp(const SixsCtx *ctx, int iaer, float wl,
     /* ---- Spherical albedo: astot ---- */
     *s_alb = log_interp(d->sphal[1][linf], d->sphal[1][lsup], wl_inf, coef, wl);
 
+    /* ---- Direct (beam) downward transmittance (scattering only) ---- *
+     * d->dtdir[1] = combined (Rayleigh + aerosol) direct transmittance at 20 wl.
+     * Log-log interpolated then scaled by the same ratio as T_down so that
+     * T_down_dir / T_down is consistent with the DISCOM ratio at the 20 bands. */
+    if (T_down_dir_out) {
+        float ddinf = d->dtdir[1][linf];
+        float ddsup = d->dtdir[1][lsup];
+        *T_down_dir_out = log_interp(ddinf, ddsup, wl_inf, coef, wl);
+    }
+
     (void)taer55p;  /* used by 6SV for taerp; not needed for our inversion */
+}
+
+/* ── Polarization interpolation ────────────────────────────────────────────── */
+void sixs_interp_polar(const SixsCtx *ctx, float wl,
+                        float *roatmq_out, float *roatmu_out)
+{
+    const SixsDisc *d = &ctx->disc;
+
+    /* Find bracketing wavelength pair */
+    int linf = 0;
+    for (int ll = 0; ll < NWL_DISC - 1; ll++) {
+        if (wl > d->wldis[ll] && wl <= d->wldis[ll + 1]) { linf = ll; break; }
+    }
+    if (wl > d->wldis[NWL_DISC - 1]) linf = NWL_DISC - 2;
+    int lsup = linf + 1;
+
+    float wl_inf = d->wldis[linf];
+    float wl_sup = d->wldis[lsup];
+    float dw     = wl_sup - wl_inf;
+
+    /* Linear fraction (log-space for consistency with the wavelength axis) */
+    float t = (dw > 1e-10f) ? logf(wl / wl_inf) / logf(wl_sup / wl_inf) : 0.0f;
+
+    /* Linear interpolation (Q/U can be negative, so log-log is not applicable) */
+    if (roatmq_out)
+        *roatmq_out = d->roatmq[1][linf] + t * (d->roatmq[1][lsup] - d->roatmq[1][linf]);
+    if (roatmu_out)
+        *roatmu_out = d->roatmu[1][linf] + t * (d->roatmu[1][lsup] - d->roatmu[1][linf]);
 }

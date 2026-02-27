@@ -1,14 +1,21 @@
-/* i.hyper.atcorr — image-based atmospheric state retrievals.
+/**
+ * \file retrieve.c
+ * \brief Image-based atmospheric state retrievals (H₂O, AOD, O₃, pressure, quality).
  *
  * Pure computation: no GRASS dependencies; compiles into both the GRASS
  * module and libatcorr.so without modification.
- * Uses sixs_E0() and sixs_earth_sun_dist2() from solar_table.c. */
+ * Uses sixs_E0() and sixs_earth_sun_dist2() from solar_table.c.
+ *
+ * \see include/retrieve.h for the public API and algorithm descriptions.
+ */
 
 #include "../include/retrieve.h"
 #include "../include/atcorr.h"   /* sixs_E0, sixs_earth_sun_dist2 */
 
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include <stdint.h>
+#include <stdlib.h>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -203,4 +210,226 @@ float retrieve_pressure_isa(float elev_m)
     if (elev_m < 0.0f)       elev_m = 0.0f;
     if (elev_m > 11000.0f)   elev_m = 11000.0f;
     return 1013.25f * powf(1.0f - 2.2558e-5f * elev_m, 5.2559f);
+}
+
+/* ─── O₂-A surface pressure retrieval ─────────────────────────────────────── */
+
+void retrieve_pressure_o2a(const float *L_740, const float *L_760,
+                             const float *L_780, int npix,
+                             float sza_deg, float vza_deg,
+                             float *out_pressure)
+{
+    /* Continuum interpolation between 740 nm and 780 nm; feature at 760 nm.
+     *
+     * Physical model (Beer-Lambert, linearised):
+     *   τ_O2(P) = K_O2 × (P / P0)
+     *   D_760   = max(0, 1 − L_760 / L_cont) ≈ τ_O2 × m  (first-order)
+     *   P       = P0 × D_760 / (K_O2 × m)
+     *
+     * K_O2 = 0.25: calibrated to ~10 nm FWHM sensors; derived from
+     * Schläpfer et al. (1998): at P=P0, SZA=0 (m=2), band-depth D ≈ 0.50.
+     * For a 5 nm sensor set K_O2 ≈ 0.40; for 20 nm use K_O2 ≈ 0.15.
+     *
+     * Reference:
+     *   Schläpfer, D., Borel, C.C., Keller, J., Itten, K.I. (1998).
+     *   Atmospheric pre-processing of DAIS airborne data. SPIE 3502.
+     */
+    static const float FRAC   = 0.5f;      /* (760−740)/(780−740) = 0.5 */
+    static const float K_O2   = 0.25f;     /* effective OD per unit air mass at P0 */
+    static const float P0     = 1013.25f;  /* sea-level pressure [hPa] */
+    static const float P_MIN  = 200.0f;    /* ~11 km altitude */
+    static const float P_MAX  = 1100.0f;
+    static const float P_DEF  = P0;
+
+    float cos_sza = cosf(sza_deg * (float)(M_PI / 180.0));
+    float cos_vza = cosf(vza_deg * (float)(M_PI / 180.0));
+    float mu_s = (cos_sza > 0.05f) ? cos_sza : 0.05f;
+    float mu_v = (cos_vza > 0.05f) ? cos_vza : 0.05f;
+    float m    = 1.0f / mu_s + 1.0f / mu_v;   /* two-way air mass */
+
+    for (int i = 0; i < npix; i++) {
+        float l74 = L_740[i], l76 = L_760[i], l78 = L_780[i];
+        if (!(l74 > 0.0f) || !(l76 > 0.0f) || !(l78 > 0.0f)) {
+            out_pressure[i] = P_DEF;
+            continue;
+        }
+        float L_cont = l74 * (1.0f - FRAC) + l78 * FRAC;
+        if (L_cont <= 0.0f || l76 >= L_cont) {
+            out_pressure[i] = P_DEF;
+            continue;
+        }
+        float D = 1.0f - l76 / L_cont;
+        if (D < 0.0f) D = 0.0f;
+        if (D > 0.95f) D = 0.95f;  /* cap: near-zero pressure is unphysical */
+
+        float P = P0 * D / (K_O2 * m);
+        out_pressure[i] = (P < P_MIN) ? P_MIN : (P > P_MAX) ? P_MAX : P;
+    }
+}
+
+/* ─── Cloud / shadow / water / snow quality bitmask ───────────────────────── */
+
+#include <stdint.h>
+
+void retrieve_quality_mask(const float *L_blue, const float *L_red,
+                            const float *L_nir,  const float *L_swir,
+                            int npix, int doy, float sza_deg,
+                            uint8_t *out_mask)
+{
+    /* Thresholds are applied to TOA reflectance (from TOA radiance).
+     *
+     * Bitmask:  MASK_CLOUD=0x01  MASK_SHADOW=0x02  MASK_WATER=0x04  MASK_SNOW=0x08
+     *
+     * Cloud:    TOA_blue > 0.25 AND NDVI < 0.2, OR TOA_nir > 0.60
+     * Shadow:   TOA_blue < 0.04 AND TOA_red < 0.04 AND TOA_nir < 0.04
+     * Water:    TOA_nir < 0.05 AND NDVI < 0.0
+     * Snow/ice: NDSI > 0.40 AND TOA_nir > 0.10   (requires L_swir)
+     *
+     * References:
+     *   Cloud / shadow: Braaten et al. (2015), Remote Sens. 7:15745
+     *   Water:          McFeeters (1996), Int. J. Remote Sens. 17:1425
+     *   Snow:           Hall et al. (1995), Remote Sens. Environ. 54:127
+     */
+    float E0_blue = sixs_E0(0.470f);
+    float E0_red  = sixs_E0(0.660f);
+    float E0_nir  = sixs_E0(0.860f);
+    float E0_swir = sixs_E0(1.600f);
+    float d2f     = (float)sixs_earth_sun_dist2(doy);
+
+    float cos_sza = cosf(sza_deg * (float)(M_PI / 180.0));
+    float mu_s    = (cos_sza > 0.05f) ? cos_sza : 0.05f;
+    float scale   = (float)M_PI * d2f / mu_s;
+
+    for (int i = 0; i < npix; i++) {
+        out_mask[i] = 0;
+        float lb = L_blue[i], lr = L_red[i], ln = L_nir[i];
+        if (!(lb > 0.0f) || !(lr > 0.0f) || !(ln > 0.0f)) continue;
+
+        float rb = scale * lb / E0_blue;
+        float rr = scale * lr / E0_red;
+        float rn = scale * ln / E0_nir;
+
+        float ndvi = (rn - rr) / (rn + rr + 1e-10f);
+
+        /* NDSI requires SWIR */
+        float ndsi = -2.0f;
+        if (L_swir && L_swir[i] > 0.0f) {
+            float rs = scale * L_swir[i] / E0_swir;
+            ndsi = (rb - rs) / (rb + rs + 1e-10f);
+        }
+
+        if ((rb > 0.25f && ndvi < 0.2f) || rn > 0.60f)
+            out_mask[i] |= RETRIEVE_MASK_CLOUD;
+
+        if (rb < 0.04f && rr < 0.04f && rn < 0.04f)
+            out_mask[i] |= RETRIEVE_MASK_SHADOW;
+
+        if (rn < 0.05f && ndvi < 0.0f)
+            out_mask[i] |= RETRIEVE_MASK_WATER;
+
+        if (ndsi > 0.40f && rn > 0.10f)
+            out_mask[i] |= RETRIEVE_MASK_SNOW;
+    }
+}
+
+/* ─── MAIAC-inspired patch AOD spatial regularization ─────────────────────── */
+
+static int _float_cmp(const void *a, const void *b)
+{
+    float fa = *(const float *)a, fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+void retrieve_aod_maiac(float *aod_data, int nrows, int ncols, int patch_sz)
+{
+    /* Segment image into non-overlapping patch_sz × patch_sz blocks.
+     * Each patch with ≥1 valid pixel uses the patch-median AOD (robust to
+     * DDV outliers).  Invalid patches are filled by inverse-distance
+     * weighting from the nearest valid patch centroids.
+     *
+     * Reference:
+     *   Lyapustin, A. et al. (2011). Multiangle implementation of atmospheric
+     *   correction (MAIAC) — Part 1. JGR 116, D05203.  This implementation
+     *   uses only the spatial regularization concept (patch-median + IDW fill),
+     *   not the full MAIAC surface model or multi-angle retrieval.
+     */
+    if (patch_sz < 2) patch_sz = 2;
+
+    int np_rows  = (nrows + patch_sz - 1) / patch_sz;
+    int np_cols  = (ncols + patch_sz - 1) / patch_sz;
+    int np_total = np_rows * np_cols;
+    int buf_max  = patch_sz * patch_sz;
+
+    float *patch_aod   = malloc((size_t)np_total * sizeof(float));
+    float *patch_row   = malloc((size_t)np_total * sizeof(float));
+    float *patch_col   = malloc((size_t)np_total * sizeof(float));
+    int   *patch_valid = malloc((size_t)np_total * sizeof(int));
+    float *patch_buf   = malloc((size_t)buf_max   * sizeof(float));
+    if (!patch_aod || !patch_row || !patch_col || !patch_valid || !patch_buf) {
+        free(patch_aod); free(patch_row); free(patch_col);
+        free(patch_valid); free(patch_buf);
+        return;   /* silently skip on OOM */
+    }
+
+    /* ── Step 1: per-patch median ── */
+    for (int pr = 0; pr < np_rows; pr++) {
+        for (int pc = 0; pc < np_cols; pc++) {
+            int pi = pr * np_cols + pc;
+            int r0 = pr * patch_sz, r1 = r0 + patch_sz; if (r1 > nrows) r1 = nrows;
+            int c0 = pc * patch_sz, c1 = c0 + patch_sz; if (c1 > ncols) c1 = ncols;
+
+            patch_row[pi] = 0.5f * (float)(r0 + r1);
+            patch_col[pi] = 0.5f * (float)(c0 + c1);
+
+            int n = 0;
+            for (int r = r0; r < r1; r++)
+                for (int c = c0; c < c1; c++) {
+                    float v = aod_data[r * ncols + c];
+                    if (isfinite(v) && v >= 0.0f)
+                        patch_buf[n++] = v;
+                }
+
+            if (n == 0) {
+                patch_valid[pi] = 0;
+                patch_aod[pi]   = -1.0f;
+            } else {
+                qsort(patch_buf, (size_t)n, sizeof(float), _float_cmp);
+                patch_aod[pi]   = patch_buf[n / 2];
+                patch_valid[pi] = 1;
+            }
+        }
+    }
+
+    /* ── Step 2: IDW fill for invalid patches ── */
+    for (int pi = 0; pi < np_total; pi++) {
+        if (patch_valid[pi]) continue;
+        double sum_w = 0.0, sum_wa = 0.0;
+        for (int pj = 0; pj < np_total; pj++) {
+            if (!patch_valid[pj]) continue;
+            float dr = patch_row[pi] - patch_row[pj];
+            float dc = patch_col[pi] - patch_col[pj];
+            double d2 = (double)(dr * dr + dc * dc);
+            if (d2 < 1.0) d2 = 1.0;
+            double w = 1.0 / d2;
+            sum_w  += w;
+            sum_wa += w * (double)patch_aod[pj];
+        }
+        patch_aod[pi] = (sum_w > 0.0) ? (float)(sum_wa / sum_w) : 0.1f;
+    }
+
+    /* ── Step 3: write patch medians back to all pixels in each patch ── */
+    for (int pr = 0; pr < np_rows; pr++) {
+        for (int pc = 0; pc < np_cols; pc++) {
+            int pi = pr * np_cols + pc;
+            float aod_p = patch_aod[pi];
+            int r0 = pr * patch_sz, r1 = r0 + patch_sz; if (r1 > nrows) r1 = nrows;
+            int c0 = pc * patch_sz, c1 = c0 + patch_sz; if (c1 > ncols) c1 = ncols;
+            for (int r = r0; r < r1; r++)
+                for (int c = c0; c < c1; c++)
+                    aod_data[r * ncols + c] = aod_p;
+        }
+    }
+
+    free(patch_aod); free(patch_row); free(patch_col);
+    free(patch_valid); free(patch_buf);
 }

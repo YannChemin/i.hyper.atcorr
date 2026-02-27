@@ -1,6 +1,18 @@
-/* LUT generation — computes R_atm, T_down, T_up, s_alb arrays.
- * Calls sixs_discom() per AOD value (H2O only affects gas absorption,
- * not scattering, so DISCOM only needs to run n_aod times). */
+/**
+ * \file lut.c
+ * \brief 3-D LUT engine: [AOD × H₂O × λ] grid computation and interpolation.
+ *
+ * Calls sixs_discom() once per AOD grid point (H₂O only affects gas
+ * absorption, not scattering, so DISCOM only needs to run n_aod times).
+ * Gas transmittance is applied per (H₂O, λ) inside the AOD loop.
+ * The outer loop is OpenMP-parallelised over AOD; each thread owns a
+ * private ::SixsCtx.
+ *
+ * Public functions (declared in include/atcorr.h):
+ *   - atcorr_compute_lut()       — full LUT build
+ *   - atcorr_lut_slice()         — bilinear (AOD, H₂O) interpolation → n_wl arrays
+ *   - atcorr_lut_interp_pixel()  — trilinear (AOD, H₂O, λ) → single pixel
+ */
 #include "../include/sixs_ctx.h"
 #include "../include/atcorr.h"
 #include "interp.h"
@@ -23,6 +35,8 @@ void sixs_discom(SixsCtx *ctx, int idatmp, int iaer,
                   float xmus, float xmuv, float phi,
                   float taer55, float taer55p, float palt, float phirad,
                   int nt, int mu, int np, float ftray, int ipol);
+void sixs_interp_polar(const SixsCtx *ctx, float wl,
+                        float *roatmq_out, float *roatmu_out);
 float sixs_gas_transmittance(SixsCtx *ctx, float wl, float xmus, float xmuv,
                                float uw, float uo3);
 
@@ -54,6 +68,12 @@ int atcorr_compute_lut(const LutConfig *cfg, LutArrays *out)
         out->T_down[i] = 1.0f;
         out->T_up[i]   = 1.0f;
     }
+    if (out->T_down_dir)
+        for (size_t i = 0; i < n; i++) out->T_down_dir[i] = 1.0f;
+    if (out->R_atmQ)
+        memset(out->R_atmQ, 0, n * sizeof(float));
+    if (out->R_atmU)
+        memset(out->R_atmU, 0, n * sizeof(float));
 
     /* Geometry */
     float xmus   = cosf(cfg->sza * (float)M_PI / 180.0f);
@@ -68,7 +88,7 @@ int atcorr_compute_lut(const LutConfig *cfg, LutArrays *out)
     int nt    = NT_P;     /* 30 atmospheric layers */
     int mu    = MU_P;     /* 25 Gauss points per hemisphere */
     int np    = 1;        /* one azimuth plane */
-    int ipol  = 0;        /* scalar */
+    int ipol  = cfg->enable_polar ? 1 : 0;  /* 0=scalar, 1=Stokes(I,Q,U) */
     int idatmp = (cfg->altitude_km > 900.0f) ? 99 :   /* satellite */
                  (cfg->altitude_km > 0.0f)   ? 4  : 0; /* plane or ground */
     float palt  = (cfg->altitude_km > 900.0f) ? 1000.0f : cfg->altitude_km;
@@ -124,11 +144,12 @@ int atcorr_compute_lut(const LutConfig *cfg, LutArrays *out)
                 size_t idx = ((size_t)ia * n_h2o + ih) * n_wl + iw;
 
                 /* Scattering quantities (no H2O dependence) via interpolation */
-                float roatm, T_down_sca, T_up_sca, s_alb;
+                float roatm, T_down_sca, T_up_sca, s_alb, T_down_dir_sca = 1.0f;
                 sixs_interp(ctx, cfg->aerosol_model, wl,
                              aod, taer55p,
                              &roatm, &T_down_sca, &T_up_sca, &s_alb,
-                             NULL, NULL);
+                             NULL, NULL,
+                             out->T_down_dir ? &T_down_dir_sca : NULL);
 
                 /* Gas transmittance (H2O-dependent): separate solar/view paths */
                 float T_gas_down = sixs_gas_transmittance(ctx, wl, xmus, xmuv,
@@ -141,6 +162,16 @@ int atcorr_compute_lut(const LutConfig *cfg, LutArrays *out)
                 out->T_down[idx] = T_down_sca * T_gas_down;
                 out->T_up  [idx] = T_up_sca   * T_gas_up;
                 out->s_alb [idx] = s_alb;
+                if (out->T_down_dir)
+                    out->T_down_dir[idx] = T_down_dir_sca * T_gas_down;
+
+                /* Polarization Q/U (H2O-independent; only when enable_polar) */
+                if (cfg->enable_polar) {
+                    float roatmq = 0.0f, roatmu = 0.0f;
+                    sixs_interp_polar(ctx, wl, &roatmq, &roatmu);
+                    if (out->R_atmQ) out->R_atmQ[idx] = roatmq;
+                    if (out->R_atmU) out->R_atmU[idx] = roatmu;
+                }
             }
         }
 

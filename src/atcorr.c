@@ -1,6 +1,10 @@
-/* i.hyper.atcorr — main shared library entry point.
- * Implements atcorr_version() and validates atcorr_compute_lut() inputs.
- * The actual LUT computation is in lut.c. */
+/**
+ * \file atcorr.c
+ * \brief Shared library entry point: version string and input validation.
+ *
+ * Implements atcorr_version() and the input-validation wrapper around
+ * atcorr_compute_lut().  The actual LUT computation is in lut.c.
+ */
 #include "../include/atcorr.h"
 #include "../include/sixs_ctx.h"
 #include <string.h>

@@ -6,6 +6,7 @@
 #include "rayleigh.h"
 #include "trunca.h"
 #include "rt.h"
+#include "ospol.h"
 #include "scatra.h"
 #include "gauss.h"
 #include <math.h>
@@ -124,7 +125,7 @@ void sixs_discom(SixsCtx *ctx,
                   int nt, int mu, int np,
                   float ftray, int ipol)
 {
-    (void)phi; (void)ipol;  /* phi used for phase init (already done); ipol always 0 */
+    (void)phi;  /* phi used for phase init (already done) */
 
     /* Save reference wavelengths */
     for (int l = 0; l < NWL_DISC; l++) ctx->disc.wldis[l] = wldisc[l];
@@ -137,10 +138,16 @@ void sixs_discom(SixsCtx *ctx,
     float rp[1] = { phirad };
     int   nfi   = 1;       /* minimum for xlphim */
 
-    /* Allocate temporary xl/xlphim for os calls */
-    float *xl     = (float*)calloc((size_t)(2*mu+1) * np, sizeof(float));
+    /* Allocate temporary xl/xlphim for os/ospol calls */
+    size_t xl_sz  = (size_t)(2 * mu + 1) * np;
+    float *xl     = (float*)calloc(xl_sz, sizeof(float));
     float *xlphim = (float*)calloc(nfi, sizeof(float));
-    if (!xl || !xlphim) { free(xl); free(xlphim); return; }
+    /* Q/U arrays for vector RT (only used when ipol=1) */
+    float *xlq    = ipol ? (float*)calloc(xl_sz, sizeof(float)) : NULL;
+    float *xlu    = ipol ? (float*)calloc(xl_sz, sizeof(float)) : NULL;
+    if (!xl || !xlphim || (ipol && (!xlq || !xlu))) {
+        free(xl); free(xlphim); free(xlq); free(xlu); return;
+    }
 
     /* ===== Loop over 20 reference wavelengths ===== */
     for (int l = 0; l < NWL_DISC; l++) {
@@ -187,47 +194,64 @@ void sixs_discom(SixsCtx *ctx,
             ctx->polar.betal[2] = 0.1f;  /* Rayleigh: simple 2-term approximation */
         }
 
-        /* ---- Atmospheric reflectances via sixs_os ---- */
+        /* ---- Atmospheric reflectances via sixs_os or sixs_ospol ---- */
         float rorayl = 0.0f, roaero = 0.0f, romix = 0.0f;
+        float rorayl_q = 0.0f, roaero_q = 0.0f, romix_q = 0.0f;
+        float rorayl_u = 0.0f, roaero_u = 0.0f, romix_u = 0.0f;
 
-        /* Rayleigh reflectance: tamoy=0, trmoy=tray */
-        memset(xl, 0, (size_t)(2*mu+1)*np*sizeof(float));
-        memset(xlphim, 0, nfi*sizeof(float));
-        sixs_os(ctx, 0,
-                0.0f, tray, pizmoy,
-                0.0f, trayp, palt,
-                phirad, nt, mu, np, nfi,
-                rm_full, gb_full, rp, xl, xlphim, NULL);
-        rorayl = xl[0] / xmus;   /* xl(-mu,1) / xmus */
+        /* Helper macro: reset xl (and xlq/xlu when ipol) and call the right RT */
+        #define RT_CALL(ta, tr, tap, trp) do { \
+            memset(xl,     0, xl_sz * sizeof(float)); \
+            memset(xlphim, 0, nfi   * sizeof(float)); \
+            if (ipol) { \
+                memset(xlq, 0, xl_sz * sizeof(float)); \
+                memset(xlu, 0, xl_sz * sizeof(float)); \
+                sixs_ospol(ctx, 0, (ta), (tr), pizmoy, (tap), (trp), palt, \
+                           phirad, nt, mu, np, nfi, \
+                           rm_full, gb_full, rp, xl, xlq, xlu, xlphim); \
+            } else { \
+                sixs_os(ctx, 0, (ta), (tr), pizmoy, (tap), (trp), palt, \
+                        phirad, nt, mu, np, nfi, \
+                        rm_full, gb_full, rp, xl, xlphim, NULL); \
+            } \
+        } while (0)
+
+        /* Rayleigh-only reflectance: tamoy=0, trmoy=tray */
+        RT_CALL(0.0f, tray, 0.0f, trayp);
+        rorayl   = xl[0] / xmus;
+        rorayl_q = xlq ? xlq[0] / xmus : 0.0f;
+        rorayl_u = xlu ? xlu[0] / xmus : 0.0f;
 
         if (iaer != 0 && taer > 1e-6f) {
             /* Aerosol-only reflectance: tamoy=taer, trmoy=0 */
-            memset(xl, 0, (size_t)(2*mu+1)*np*sizeof(float));
-            memset(xlphim, 0, nfi*sizeof(float));
-            sixs_os(ctx, 0,
-                    tamoy, 0.0f, pizmoy,
-                    tamoyp, 0.0f, palt,
-                    phirad, nt, mu, np, nfi,
-                    rm_full, gb_full, rp, xl, xlphim, NULL);
-            roaero = xl[0] / xmus;
+            RT_CALL(tamoy, 0.0f, tamoyp, 0.0f);
+            roaero   = xl[0] / xmus;
+            roaero_q = xlq ? xlq[0] / xmus : 0.0f;
+            roaero_u = xlu ? xlu[0] / xmus : 0.0f;
 
             /* Combined (Rayleigh + aerosol) reflectance */
-            memset(xl, 0, (size_t)(2*mu+1)*np*sizeof(float));
-            memset(xlphim, 0, nfi*sizeof(float));
-            sixs_os(ctx, 0,
-                    tamoy, tray, pizmoy,
-                    tamoyp, trayp, palt,
-                    phirad, nt, mu, np, nfi,
-                    rm_full, gb_full, rp, xl, xlphim, NULL);
-            romix = xl[0] / xmus;
+            RT_CALL(tamoy, tray, tamoyp, trayp);
+            romix   = xl[0] / xmus;
+            romix_q = xlq ? xlq[0] / xmus : 0.0f;
+            romix_u = xlu ? xlu[0] / xmus : 0.0f;
         } else {
-            roaero = 0.0f;
-            romix  = rorayl;
+            roaero   = 0.0f; roaero_q = 0.0f; roaero_u = 0.0f;
+            romix    = rorayl;
+            romix_q  = rorayl_q;
+            romix_u  = rorayl_u;
         }
 
-        ctx->disc.roatm[0][l] = rorayl;
-        ctx->disc.roatm[1][l] = romix;
-        ctx->disc.roatm[2][l] = roaero;
+        #undef RT_CALL
+
+        ctx->disc.roatm[0][l]  = rorayl;
+        ctx->disc.roatm[1][l]  = romix;
+        ctx->disc.roatm[2][l]  = roaero;
+        ctx->disc.roatmq[0][l] = rorayl_q;
+        ctx->disc.roatmq[1][l] = romix_q;
+        ctx->disc.roatmq[2][l] = roaero_q;
+        ctx->disc.roatmu[0][l] = rorayl_u;
+        ctx->disc.roatmu[1][l] = romix_u;
+        ctx->disc.roatmu[2][l] = roaero_u;
 
         /* ---- Scattering transmittances ---- */
         float ddirtt, ddiftt, udirtt, udiftt, sphalbt;
@@ -259,4 +283,6 @@ void sixs_discom(SixsCtx *ctx,
 
     free(xl);
     free(xlphim);
+    free(xlq);
+    free(xlu);
 }

@@ -1,5 +1,9 @@
-/* Adjacency effect correction — Vermote et al. (1997).
- * See include/adjacency.h for API documentation. */
+/**
+ * \file adjacency.c
+ * \brief Adjacency effect correction (Vermote et al. 1997).
+ *
+ * \see include/adjacency.h for the public API and algorithm description.
+ */
 
 #include "adjacency.h"
 #include "spatial.h"

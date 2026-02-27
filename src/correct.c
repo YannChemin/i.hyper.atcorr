@@ -9,7 +9,8 @@
  * Outputs Rs, Tds, Tus, ss must be pre-allocated with cfg->n_wl floats. */
 void atcorr_lut_slice(const LutConfig *cfg, const LutArrays *lut,
                       float aod_val, float h2o_val,
-                      float *Rs, float *Tds, float *Tus, float *ss)
+                      float *Rs, float *Tds, float *Tus, float *ss,
+                      float *Tdds)
 {
     int na = cfg->n_aod, nh = cfg->n_h2o, nw = cfg->n_wl;
 
@@ -45,6 +46,10 @@ void atcorr_lut_slice(const LutConfig *cfg, const LutArrays *lut,
         Tds[iw] = BI4(lut->T_down);
         Tus[iw] = BI4(lut->T_up);
         ss[iw]  = BI4(lut->s_alb);
+        if (Tdds && lut->T_down_dir)
+            Tdds[iw] = BI4(lut->T_down_dir);
+        else if (Tdds)
+            Tdds[iw] = Tds[iw];  /* fallback: no direct/diffuse split */
     }
 #undef BI4
 #undef IDX

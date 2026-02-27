@@ -408,6 +408,44 @@ lut = apply_srf_correction(cfg, lut, fwhm_um=band_fwhm, threshold_nm=5.0)
 
 ---
 
+## Validation — Fortran 6SV2.1 compatibility
+
+`testsuite/test_fortran_compat.py` (25 tests) cross-checks every C function
+in `libatcorr.so` against the original Fortran 77 subroutines compiled from
+`~/dev/6SV2.1/`.  All 25 tests pass with no C code bugs found.
+
+| Subroutine | Function tested | Tests | Tolerance | Actual agreement |
+|---|---|---|---|---|
+| CHAND | `sixs_chand()` – Chandrasekhar Rayleigh reflectance | 4 geometries | rtol=1×10⁻⁵ | ~7×10⁻⁸ (float32 limit) |
+| ODRAYL | `sixs_odrayl()` – Rayleigh optical depth (Edlén 1966) | 4 wavelengths | rtol=5×10⁻³ | ~2×10⁻⁷ |
+| VARSOL × d² ≈ 1 | `sixs_earth_sun_dist2()` – Earth-Sun distance | 4 DOYs | rtol=5×10⁻³ | <0.07% |
+| SOLIRR / E0 on-grid | `sixs_E0()` – Thuillier solar irradiance | 4 wavelengths | rtol=1×10⁻³ | 0–3 ULP |
+| SOLIRR / E0 off-grid | `sixs_E0()` – linear vs nearest-neighbour interp | 1 wavelength | rtol=1×10⁻³ | 0.035% |
+| CSALBR | `sixs_csalbr()` – Rayleigh spherical albedo | 3 τ values | rtol=1×10⁻⁵ | ~9×10⁻⁸ (float32 limit) |
+| GAUSS | `sixs_gauss()` – Gauss-Legendre quadrature | n=4 and n=8, weight sums, symmetry | rtol=1×10⁻⁵ | Exact float32 |
+
+Minor intentional differences:
+- `sixs_E0()` uses linear interpolation for off-grid wavelengths; Fortran SOLIRR uses nearest-neighbour — both agree to 0.035% (smooth solar spectrum).
+- `sixs_earth_sun_dist2()` returns d² (< 1 at perihelion); Fortran VARSOL returns 1/d² (> 1 at perihelion) — the product ≈ 1.0 within 0.07%, confirming complementary conventions.
+- Solar table float32 literals produce 0–3 ULP differences between gfortran and the C compiler at parse time — not a bug.
+
+**Build and run:**
+
+```sh
+# Compile 6SV2.1 Fortran objects (first time only)
+cd ~/dev/6sV2.1
+gfortran -O -ffixed-line-length-132 -c CHAND.f ODRAYL.f VARSOL.f SOLIRR.f CSALBR.f GAUSS.f US62.f
+
+# Run all 25 compatibility tests
+cd ~/dev/i.hyper.atcorr
+grass --tmp-project XY --exec python3 testsuite/test_fortran_compat.py
+```
+
+The test driver (`testsuite/test_6sv_compat.f90`) is compiled automatically
+by the Python test suite when the Fortran objects are present.
+
+---
+
 ## References
 
 - Vermote, E.F., Tanré, D., Deuzé, J.L., Herman, M. and Morcrette, J.J.

@@ -1,5 +1,9 @@
-/* Surface reflectance prior — 3-component Gaussian mixture.
- * See include/surface_model.h for API documentation. */
+/**
+ * \file surface_model.c
+ * \brief 3-component surface reflectance prior and MAP regularisation.
+ *
+ * \see include/surface_model.h for the public API.
+ */
 
 #include "surface_model.h"
 

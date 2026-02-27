@@ -1,5 +1,9 @@
-/* Reflectance uncertainty propagation.
- * See include/uncertainty.h for API documentation. */
+/**
+ * \file uncertainty.c
+ * \brief Per-band reflectance uncertainty propagation (noise + AOD perturbation).
+ *
+ * \see include/uncertainty.h for the public API.
+ */
 
 #include "uncertainty.h"
 #include "../include/atcorr.h"

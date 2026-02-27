@@ -1,0 +1,60 @@
+# Doxyfile for i.hyper.atcorr
+# Generates the programmer's manual from Doxygen comments in C headers,
+# source files, Python bindings, and testsuite.
+#
+# Usage:
+#   doxygen Doxyfile
+# Output: doc/html/index.html
+
+PROJECT_NAME           = "i.hyper.atcorr — Programmer's Manual"
+PROJECT_NUMBER         = "1.0.0"
+PROJECT_BRIEF          = "6SV2.1-based hyperspectral atmospheric correction library"
+OUTPUT_DIRECTORY       = doc
+CREATE_SUBDIRS         = NO
+
+# ── Input ──────────────────────────────────────────────────────────────────────
+INPUT                  = doc/mainpage.dox \
+                         include \
+                         src \
+                         main.c \
+                         python \
+                         testsuite
+FILE_PATTERNS          = *.c *.h *.py *.dox
+RECURSIVE              = NO
+EXCLUDE_PATTERNS       = */build/* */dist.* *.so
+
+# ── Extraction ─────────────────────────────────────────────────────────────────
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+EXTRACT_PRIVATE        = NO
+INTERNAL_DOCS          = NO
+
+# ── Output formats ─────────────────────────────────────────────────────────────
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_LATEX         = NO
+GENERATE_MAN           = NO
+
+# ── Preprocessing ──────────────────────────────────────────────────────────────
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = NO
+
+# ── Diagrams ───────────────────────────────────────────────────────────────────
+HAVE_DOT               = NO
+
+# ── Appearance ─────────────────────────────────────────────────────────────────
+QUIET                  = NO
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+SHOW_INCLUDE_FILES     = YES
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+
+# ── Search / index ─────────────────────────────────────────────────────────────
+SEARCHENGINE           = NO
+GENERATE_TREEVIEW      = YES
+
+# ── C / Python specifics ───────────────────────────────────────────────────────
+OPTIMIZE_OUTPUT_FOR_C  = YES
+PYTHON_DOCSTRING       = YES
+JAVADOC_AUTOBRIEF      = YES

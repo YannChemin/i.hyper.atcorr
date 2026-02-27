@@ -1,4 +1,7 @@
-/****************************************************************************
+/**
+ * \file main.c
+ * \brief GRASS GIS module \c i.hyper.atcorr — 6SV2.1-based atmospheric correction.
+ *
  * MODULE:      i.hyper.atcorr
  * AUTHOR:      i.hyper.smac project
  * PURPOSE:     6SV2.1-based atmospheric correction for hyperspectral imagery.
@@ -41,6 +44,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +56,8 @@
 #include "include/surface_model.h"
 #include "include/uncertainty.h"
 #include "include/retrieve.h"
+#include "include/terrain.h"
+#include "include/oe_invert.h"
 
 #define LUT_MAGIC   0x4C555400u
 #define LUT_VERSION 1u
@@ -76,6 +82,24 @@ typedef struct {
     /* #4/#6 Uncertainty */
     int         do_uncertainty;
     const char *unc_output;   /* Output Raster3D name, or NULL */
+
+    /* Terrain illumination correction */
+    const char *slope_map;        /* 2-D slope raster [°], or NULL */
+    const char *aspect_map;       /* 2-D aspect raster [°, CW from North], or NULL */
+    float       sun_azimuth;      /* solar azimuth [°, CW from North] */
+    const char *vza_map;          /* 2-D per-pixel VZA raster [°], or NULL */
+    const char *vaa_map;          /* 2-D per-pixel VAA raster [°, CW from North], or NULL */
+
+    /* NBAR normalization (Ross-Li kernel weights, e.g. from MCD43) */
+    const char *brdf_fiso_map;    /* f_iso raster, or NULL */
+    const char *brdf_fvol_map;    /* f_vol raster, or NULL */
+    const char *brdf_fgeo_map;    /* f_geo raster, or NULL */
+
+    /* Per-pixel O₂-A surface pressure (hPa) */
+    float      *pressure_data;    /* float[nrows*ncols] or NULL */
+
+    /* Pre-computed quality bitmask (RETRIEVE_MASK_*) */
+    uint8_t    *quality_data;     /* uint8_t[nrows*ncols] or NULL */
 } IsoFitParams;
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
@@ -398,7 +422,47 @@ static void correct_raster3d(const char *input_name, const char *output_name,
         free_h2o_map = 1;
     }
 
-    int use_per_pixel = have_aod_map || have_h2o_map;
+    /* ── Per-pixel surface pressure (O₂-A derived) ── */
+    int     have_pressure_map = (iso && iso->pressure_data);
+    float  *pressure_data     = have_pressure_map ? iso->pressure_data : NULL;
+    float   P_lut             = (cfg->surface_pressure > 0.0f)
+                                    ? cfg->surface_pressure : 1013.25f;
+
+    /* ── Quality bitmask (pre-correction; passed through from main) ── */
+    uint8_t *quality_data = (iso && iso->quality_data) ? iso->quality_data : NULL;
+    (void)quality_data;   /* available for future per-pixel masking */
+
+    int use_per_pixel = have_aod_map || have_h2o_map || have_pressure_map;
+
+    /* ── Load terrain rasters ── */
+    float *slope_data  = NULL;
+    float *aspect_data = NULL;
+    float *vza_data    = NULL;
+    float *vaa_data    = NULL;
+    int    have_terrain = (iso && iso->slope_map && iso->aspect_map
+                           && lut->T_down_dir != NULL);
+    if (have_terrain) {
+        G_message(_("Loading terrain rasters for illumination correction..."));
+        slope_data  = load_raster2d(iso->slope_map,  nrows, ncols, 0.0f);
+        aspect_data = load_raster2d(iso->aspect_map, nrows, ncols, 0.0f);
+        if (iso->vza_map && iso->vza_map[0])
+            vza_data = load_raster2d(iso->vza_map, nrows, ncols, cfg->vza);
+        if (iso->vaa_map && iso->vaa_map[0])
+            vaa_data = load_raster2d(iso->vaa_map, nrows, ncols, iso->sun_azimuth);
+    }
+
+    /* ── Load NBAR kernel-weight rasters ── */
+    float *fiso_data = NULL;
+    float *fvol_data = NULL;
+    float *fgeo_data = NULL;
+    int    have_nbar = (iso && iso->brdf_fiso_map && iso->brdf_fvol_map
+                        && iso->brdf_fgeo_map);
+    if (have_nbar) {
+        G_message(_("Loading BRDF kernel rasters for NBAR normalization..."));
+        fiso_data = load_raster2d(iso->brdf_fiso_map, nrows, ncols, 1.0f);
+        fvol_data = load_raster2d(iso->brdf_fvol_map, nrows, ncols, 0.0f);
+        fgeo_data = load_raster2d(iso->brdf_fgeo_map, nrows, ncols, 0.0f);
+    }
 
     /* ── Pre-compute scalar LUT slice (used when no per-pixel maps) ── */
     int    n_wl = cfg->n_wl;
@@ -406,7 +470,8 @@ static void correct_raster3d(const char *input_name, const char *output_name,
     float *Tds  = G_malloc(n_wl * sizeof(float));
     float *Tus  = G_malloc(n_wl * sizeof(float));
     float *ss   = G_malloc(n_wl * sizeof(float));
-    atcorr_lut_slice(cfg, lut, aod_val, h2o_val, Rs, Tds, Tus, ss);
+    float *Tdds = have_terrain ? G_malloc(n_wl * sizeof(float)) : NULL;
+    atcorr_lut_slice(cfg, lut, aod_val, h2o_val, Rs, Tds, Tus, ss, Tdds);
 
     G_verbose_message(
         _("Correction slice at AOD=%.3f, H2O=%.2f g/cm²: "
@@ -521,8 +586,13 @@ static void correct_raster3d(const char *input_name, const char *output_name,
             }
 
         /* ── Per-pixel inversion ── */
-        if (use_per_pixel) {
-            /* Per-pixel AOD/H2O: trilinear LUT interpolation per pixel */
+
+        /* Scalar direct T_d for this band (terrain); cos(vza_ref) for T_up scaling */
+        float T_d_dir_s   = Tdds ? interp_wl(Tdds, cfg->wl, n_wl, wl) : T_d_s;
+        float cos_vza_ref = cosf(cfg->vza * (float)(M_PI / 180.0));
+
+        if (use_per_pixel || have_terrain || have_nbar) {
+            /* Per-pixel path: AOD/H2O LUT interp + terrain + NBAR */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -530,17 +600,76 @@ static void correct_raster3d(const char *input_name, const char *output_name,
                 float L = rad_band[i];
                 if (!isfinite(L) || E0 <= 0.0f) { refl_band[i] = NAN; continue; }
 
-                float a_px = have_aod_map ? aod_map_data[i] : aod_val;
-                float h_px = have_h2o_map ? h2o_map_data[i] : h2o_val;
-
                 float R_a, T_d, T_u, s_a;
-                atcorr_lut_interp_pixel(cfg, lut, a_px, h_px, wl,
-                                         &R_a, &T_d, &T_u, &s_a);
+                if (use_per_pixel) {
+                    float a_px = have_aod_map ? aod_map_data[i] : aod_val;
+                    float h_px = have_h2o_map ? h2o_map_data[i] : h2o_val;
+                    atcorr_lut_interp_pixel(cfg, lut, a_px, h_px, wl,
+                                             &R_a, &T_d, &T_u, &s_a);
+                } else {
+                    R_a = R_a_s; T_d = T_d_s; T_u = T_u_s; s_a = s_a_s;
+                }
+
+                /* Terrain illumination correction */
+                if (have_terrain) {
+                    float slope_px  = isfinite(slope_data[i])  ? slope_data[i]  : 0.0f;
+                    float aspect_px = isfinite(aspect_data[i]) ? aspect_data[i] : 0.0f;
+                    float vza_px    = vza_data
+                        ? (isfinite(vza_data[i]) ? vza_data[i] : cfg->vza)
+                        : cfg->vza;
+                    float cos_i = cos_incidence(cfg->sza, iso->sun_azimuth,
+                                                slope_px, aspect_px);
+                    float V_d   = skyview_factor(slope_px);
+                    T_d = atcorr_terrain_T_down(T_d, T_d_dir_s, cos_szaf, cos_i, V_d);
+                    T_u = atcorr_terrain_T_up(T_u, cos_vza_ref, vza_px);
+                }
+
+                /* Per-pixel surface pressure correction (O₂-A derived).
+                 * Rayleigh OD ∝ P; correct R_atm and transmittances for the
+                 * pressure difference between the pixel and the LUT reference.
+                 *   τ_R(λ,P) = 0.00877 × λ^(−4.05) × P/P_ref  (Hansen & Travis 1974)
+                 *   ΔP_frac  = (P_pixel − P_lut) / P_lut
+                 *   R_atm   *= P_pixel / P_lut          (Rayleigh ∝ P)
+                 *   T_down  *= exp(−τ_R(λ,P_lut) × ΔP_frac / cos_sza)
+                 *   T_up    *= exp(−τ_R(λ,P_lut) × ΔP_frac / cos_vza) */
+                if (have_pressure_map && isfinite(pressure_data[i])) {
+                    float P_px     = pressure_data[i];
+                    float dP_frac  = (P_px - P_lut) / P_lut;
+                    if (fabsf(dP_frac) > 0.001f) {
+                        float tau_R    = 0.00877f * powf(wl, -4.05f);
+                        float cos_vza_px = cos_vza_ref;
+                        if (vza_data && isfinite(vza_data[i]))
+                            cos_vza_px = cosf(vza_data[i] * (float)(M_PI/180.0));
+                        if (cos_vza_px < 0.05f) cos_vza_px = 0.05f;
+                        R_a *= (P_px / P_lut);
+                        T_d *= expf(-tau_R * dP_frac / cos_szaf);
+                        T_u *= expf(-tau_R * dP_frac / cos_vza_px);
+                    }
+                }
 
                 float rho_toa = (float)(M_PI * L * d2) / (E0 * cos_szaf);
-                refl_band[i]  = use_brdf
+                float rho_boa = use_brdf
                     ? atcorr_invert_brdf(rho_toa, R_a, T_d, T_u, s_a, rho_albe_brdf)
                     : atcorr_invert(rho_toa, R_a, T_d, T_u, s_a);
+
+                /* NBAR normalization (Ross-Li MCD43 kernels) */
+                if (have_nbar && isfinite(rho_boa)) {
+                    float f_iso = isfinite(fiso_data[i]) ? fiso_data[i] : 1.0f;
+                    float f_vol = isfinite(fvol_data[i]) ? fvol_data[i] : 0.0f;
+                    float f_geo = isfinite(fgeo_data[i]) ? fgeo_data[i] : 0.0f;
+                    float vza_obs = vza_data
+                        ? (isfinite(vza_data[i]) ? vza_data[i] : cfg->vza)
+                        : cfg->vza;
+                    float vaa_obs = vaa_data
+                        ? (isfinite(vaa_data[i]) ? vaa_data[i] : iso->sun_azimuth)
+                        : iso->sun_azimuth;
+                    float raa_obs = iso->sun_azimuth - vaa_obs;
+                    rho_boa = atcorr_brdf_normalize(rho_boa, f_iso, f_vol, f_geo,
+                                                     cfg->sza, vza_obs, raa_obs,
+                                                     cfg->sza);
+                }
+
+                refl_band[i] = rho_boa;
             }
         } else {
             /* Scalar correction (original path) */
@@ -673,6 +802,10 @@ static void correct_raster3d(const char *input_name, const char *output_name,
     /* ── Cleanup ── */
     G_free(band_wl);    G_free(band_fwhm);
     G_free(Rs);         G_free(Tds);     G_free(Tus);   G_free(ss);
+    G_free(Tdds);
+    G_free(slope_data); G_free(aspect_data);
+    G_free(vza_data);   G_free(vaa_data);
+    G_free(fiso_data);  G_free(fvol_data);  G_free(fgeo_data);
     G_free(rad_band);   G_free(refl_band);
     G_free(sigma_band);
     G_free(refl_cube);  G_free(sigma_cube);
@@ -949,6 +1082,95 @@ int main(int argc, char *argv[])
           "Requires input= with wavelength metadata.");
     flag_z->guisection = _("Retrieval");
 
+    struct Flag *flag_p = G_define_flag();
+    flag_p->key = 'p';
+    flag_p->label = _("Retrieve per-pixel surface pressure from O₂-A band (760 nm)");
+    flag_p->description =
+        _("Estimates per-pixel surface pressure [hPa] from the O₂-A band depth "
+          "(continuum: 740/760/780 nm). "
+          "Applies per-pixel Rayleigh scaling to R_atm, T_down, T_up. "
+          "K_O2=0.25 calibrated to ~10 nm FWHM sensors. "
+          "Requires input= with wavelength metadata.");
+    flag_p->guisection = _("Retrieval");
+
+    struct Flag *flag_m = G_define_flag();
+    flag_m->key = 'm';
+    flag_m->label = _("Compute pre-correction cloud / shadow / water / snow bitmask");
+    flag_m->description =
+        _("Classifies each pixel using TOA reflectance thresholds "
+          "(cloud: blue>0.25 AND NDVI<0.2; shadow: VIS+NIR<0.04; water: NIR<0.05; "
+          "snow: NDSI>0.4). "
+          "Output written to quality= map. "
+          "DDV and H₂O retrievals automatically exclude flagged pixels. "
+          "Requires input= with wavelength metadata.");
+    flag_m->guisection = _("Retrieval");
+
+    struct Flag *flag_P = G_define_flag();
+    flag_P->key = 'P';
+    flag_P->label = _("Enable vector (Stokes I,Q,U) radiative transfer");
+    flag_P->description =
+        _("Use sixs_ospol() instead of sixs_os() for the atmospheric RT. "
+          "Propagates all three Stokes components simultaneously, improving "
+          "the atmospheric path reflectance R_atm by 1–5% in blue bands "
+          "(Rayleigh polarisation feedback). "
+          "Approximately 3× slower than scalar RT. "
+          "Aerosol is treated as spherical (simplified Müller matrix).");
+    flag_P->guisection = _("LUT");
+
+    struct Flag *flag_e = G_define_flag();
+    flag_e->key = 'e';
+    flag_e->label = _("Joint AOD + H₂O optimal-estimation retrieval");
+    flag_e->description =
+        _("Per-pixel MAP grid-search inversion of AOD and column water vapour "
+          "using spectral smoothness (VIS) and H₂O band-depth (NIR) constraints. "
+          "Supersedes independent -a and -w retrievals when used together. "
+          "Requires input= with wavelength metadata and a pre-computed LUT.");
+    flag_e->guisection = _("Retrieval");
+
+    struct Option *opt_oe_sigma_aod = G_define_option();
+    opt_oe_sigma_aod->key         = "oe_sigma_aod";
+    opt_oe_sigma_aod->type        = TYPE_DOUBLE;
+    opt_oe_sigma_aod->required    = NO;
+    opt_oe_sigma_aod->answer      = "0.5";
+    opt_oe_sigma_aod->label       = _("OE prior uncertainty for log(AOD)");
+    opt_oe_sigma_aod->description =
+        _("Controls how strongly the OE solution is pulled toward aod_val=. "
+          "0.5 = broad prior (±50% in log-AOD space); 0.2 = tight constraint.");
+    opt_oe_sigma_aod->guisection  = _("Retrieval");
+
+    struct Option *opt_oe_sigma_h2o = G_define_option();
+    opt_oe_sigma_h2o->key         = "oe_sigma_h2o";
+    opt_oe_sigma_h2o->type        = TYPE_DOUBLE;
+    opt_oe_sigma_h2o->required    = NO;
+    opt_oe_sigma_h2o->answer      = "1.0";
+    opt_oe_sigma_h2o->label       = _("OE prior uncertainty for H₂O [g/cm²]");
+    opt_oe_sigma_h2o->description =
+        _("Controls H₂O prior strength. 1.0 = broad (±1 g/cm²); 0.5 = tight.");
+    opt_oe_sigma_h2o->guisection  = _("Retrieval");
+
+    struct Option *opt_maiac_patch = G_define_option();
+    opt_maiac_patch->key         = "maiac_patch";
+    opt_maiac_patch->type        = TYPE_INTEGER;
+    opt_maiac_patch->required    = NO;
+    opt_maiac_patch->answer      = "0";
+    opt_maiac_patch->label       = _("MAIAC patch size for AOD spatial regularization (pixels; 0=disabled)");
+    opt_maiac_patch->description =
+        _("After DDV retrieval (-a), divides the image into non-overlapping "
+          "patches of this size and replaces each patch AOD with the patch median. "
+          "Non-DDV patches are filled by inverse-distance weighting. "
+          "Typical: 32 pixels for 30 m imagery; 16 for 5 m imagery.");
+    opt_maiac_patch->guisection  = _("Retrieval");
+
+    struct Option *opt_quality = G_define_standard_option(G_OPT_R_OUTPUT);
+    opt_quality->key      = "quality";
+    opt_quality->required = NO;
+    opt_quality->label    = _("Output 2-D quality bitmask raster (requires -m flag)");
+    opt_quality->description =
+        _("Per-pixel quality bitmask: "
+          "bit 0=cloud, bit 1=shadow, bit 2=water, bit 3=snow/ice. "
+          "Written as integer raster.");
+    opt_quality->guisection = _("Retrieval");
+
     struct Option *opt_dem = G_define_standard_option(G_OPT_R_INPUT);
     opt_dem->key      = "dem";
     opt_dem->required = NO;
@@ -958,6 +1180,85 @@ int main(int argc, char *argv[])
           "Scene-mean elevation → ISA pressure, overriding standard-atmosphere "
           "sea-level pressure in LUT computation.");
     opt_dem->guisection = _("Retrieval");
+
+    /* ── Terrain illumination correction ── */
+    struct Option *opt_slope = G_define_standard_option(G_OPT_R_INPUT);
+    opt_slope->key      = "slope";
+    opt_slope->required = NO;
+    opt_slope->label    = _("Terrain slope raster [degrees]");
+    opt_slope->description =
+        _("2-D raster of terrain slope in degrees. "
+          "When combined with aspect=, enables per-pixel terrain illumination "
+          "correction (Cosine model: direct irradiance scaled by cos_i/cos_sza, "
+          "diffuse by the skyview factor).");
+    opt_slope->guisection = _("Terrain");
+
+    struct Option *opt_aspect = G_define_standard_option(G_OPT_R_INPUT);
+    opt_aspect->key      = "aspect";
+    opt_aspect->required = NO;
+    opt_aspect->label    = _("Terrain aspect raster [degrees, CW from North]");
+    opt_aspect->description =
+        _("2-D raster of terrain aspect in degrees clockwise from North. "
+          "Must be provided together with slope=.");
+    opt_aspect->guisection = _("Terrain");
+
+    struct Option *opt_sun_az = G_define_option();
+    opt_sun_az->key         = "sun_azimuth";
+    opt_sun_az->type        = TYPE_DOUBLE;
+    opt_sun_az->required    = NO;
+    opt_sun_az->answer      = "180";
+    opt_sun_az->label       = _("Solar azimuth angle [degrees, CW from North]");
+    opt_sun_az->description =
+        _("Used for terrain illumination (cos_incidence) and NBAR relative "
+          "azimuth computation. Typically from r.sunmask or scene metadata.");
+    opt_sun_az->guisection  = _("Terrain");
+
+    struct Option *opt_vza_map = G_define_standard_option(G_OPT_R_INPUT);
+    opt_vza_map->key      = "view_zenith";
+    opt_vza_map->required = NO;
+    opt_vza_map->label    = _("Per-pixel view zenith angle raster [degrees]");
+    opt_vza_map->description =
+        _("2-D raster of per-pixel view zenith angles. "
+          "Used for T_up Beer-Lambert path-length scaling in terrain correction. "
+          "Falls back to scalar vza= when not provided.");
+    opt_vza_map->guisection = _("Terrain");
+
+    struct Option *opt_vaa_map = G_define_standard_option(G_OPT_R_INPUT);
+    opt_vaa_map->key      = "view_azimuth";
+    opt_vaa_map->required = NO;
+    opt_vaa_map->label    = _("Per-pixel view azimuth angle raster [degrees, CW from North]");
+    opt_vaa_map->description =
+        _("2-D raster of per-pixel view azimuth angles. "
+          "Used to compute relative azimuth for NBAR normalization.");
+    opt_vaa_map->guisection = _("Terrain");
+
+    /* ── NBAR normalization (MCD43 Ross-Li kernel weights) ── */
+    struct Option *opt_fiso = G_define_standard_option(G_OPT_R_INPUT);
+    opt_fiso->key      = "brdf_fiso";
+    opt_fiso->required = NO;
+    opt_fiso->label    = _("MCD43 f_iso kernel weight raster");
+    opt_fiso->description =
+        _("Ross-Li isotropic kernel weight from MODIS MCD43A1. "
+          "When all three kernel weights (brdf_fiso=, brdf_fvol=, brdf_fgeo=) "
+          "are provided, output reflectance is NBAR-normalized to nadir view "
+          "using standard MODIS Ross-Thick + Li-Sparse kernels.");
+    opt_fiso->guisection = _("BRDF");
+
+    struct Option *opt_fvol = G_define_standard_option(G_OPT_R_INPUT);
+    opt_fvol->key      = "brdf_fvol";
+    opt_fvol->required = NO;
+    opt_fvol->label    = _("MCD43 f_vol kernel weight raster");
+    opt_fvol->description =
+        _("Ross-Thick volumetric kernel weight from MODIS MCD43A1.");
+    opt_fvol->guisection = _("BRDF");
+
+    struct Option *opt_fgeo = G_define_standard_option(G_OPT_R_INPUT);
+    opt_fgeo->key      = "brdf_fgeo";
+    opt_fgeo->required = NO;
+    opt_fgeo->label    = _("MCD43 f_geo kernel weight raster");
+    opt_fgeo->description =
+        _("Li-Sparse geometric kernel weight from MODIS MCD43A1.");
+    opt_fgeo->guisection = _("BRDF");
 
     if (G_parser(argc, argv))
         exit(EXIT_FAILURE);
@@ -971,8 +1272,13 @@ int main(int argc, char *argv[])
         G_warning(_("uncertainty= output ignored without -u flag"));
     if (flag_u->answer && !opt_output->answer)
         G_fatal_error(_("-u requires output= (needs correction to run first)"));
-    if ((flag_a->answer || flag_w->answer || flag_z->answer) && !opt_input->answer)
-        G_fatal_error(_("Flags -a, -w, -z require input="));
+    if ((flag_a->answer || flag_w->answer || flag_z->answer ||
+         flag_p->answer || flag_m->answer || flag_e->answer) && !opt_input->answer)
+        G_fatal_error(_("Flags -a, -w, -z, -p, -m, -e require input="));
+    if (flag_m->answer && !opt_quality->answer)
+        G_warning(_("-m flag has no effect without quality= output option"));
+    if (opt_quality->answer && !flag_m->answer)
+        G_warning(_("quality= output requires -m flag"));
 
     /* ── Parse scalar parameters ── */
     float sza      = (float)atof(opt_sza->answer);
@@ -995,6 +1301,22 @@ int main(int argc, char *argv[])
         G_fatal_error(_("Invalid wavelength range or step"));
     if (doy < 1 || doy > 365)
         G_fatal_error(_("doy must be in [1, 365]"));
+
+    float sun_azimuth = (float)atof(opt_sun_az->answer);
+
+    /* Terrain: slope= and aspect= must be specified together */
+    if ((opt_slope->answer && !opt_aspect->answer) ||
+        (!opt_slope->answer && opt_aspect->answer))
+        G_fatal_error(_("slope= and aspect= must both be provided for "
+                        "terrain illumination correction"));
+    int do_terrain = (opt_slope->answer && opt_aspect->answer);
+
+    /* NBAR: all three kernel-weight rasters must be provided */
+    int nbar_count = (!!opt_fiso->answer + !!opt_fvol->answer + !!opt_fgeo->answer);
+    if (nbar_count > 0 && nbar_count < 3)
+        G_fatal_error(_("brdf_fiso=, brdf_fvol=, and brdf_fgeo= must all be "
+                        "provided for NBAR normalization"));
+    int do_nbar = (nbar_count == 3);
 
     int atmo_model;
     if      (!strcmp(opt_atmo->answer, "us62"))     atmo_model = ATMO_US62;
@@ -1066,17 +1388,21 @@ int main(int argc, char *argv[])
         .atmo_model = atmo_model, .aerosol_model = aerosol_model,
         .surface_pressure = 0.0f, .ozone_du = ozone,
         .brdf_type = brdf_type, .brdf_params = brdf_params,
+        .enable_polar = flag_P->answer ? 1 : 0,
     };
 
     /* ── Image-based atmospheric state retrievals ── *
      * Performed before atcorr_compute_lut() so that O3 and surface pressure
      * updates flow into the LUT.  AOD and H2O per-pixel maps are stored and
      * passed to correct_raster3d() via IsoFitParams.aod_data / .h2o_data. */
-    float *retrieved_aod = NULL;
-    float *retrieved_h2o = NULL;
+    float   *retrieved_aod      = NULL;
+    float   *retrieved_h2o      = NULL;
+    float   *retrieved_pressure = NULL;
+    uint8_t *retrieved_quality  = NULL;
 
     if (opt_input->answer &&
-        (flag_a->answer || flag_w->answer || flag_z->answer)) {
+        (flag_a->answer || flag_w->answer || flag_z->answer ||
+         flag_p->answer || flag_m->answer || flag_e->answer)) {
 
         /* Open the input cube to get exact dims and band wavelengths */
         const char *ret_mapset = G_find_raster3d(opt_input->answer, "");
@@ -1194,6 +1520,102 @@ int main(int argc, char *argv[])
             G_free(L_470); G_free(L_660); G_free(L_860); G_free(L_2130);
             aod_val = aod_mean;
             G_message(_("AOD retrieved (DDV): %.3f scene mean at 550 nm"), aod_mean);
+
+            /* ── MAIAC patch AOD spatial regularization ── */
+            int maiac_patch = atoi(opt_maiac_patch->answer);
+            if (maiac_patch >= 2) {
+                G_message(_("MAIAC patch regularization (patch_sz=%d px)..."),
+                          maiac_patch);
+                retrieve_aod_maiac(retrieved_aod, ret_nrows, ret_ncols, maiac_patch);
+                /* Recompute scene-mean after patch regularization */
+                double s2 = 0.0; int n2 = 0;
+                for (int i = 0; i < ret_npix; i++)
+                    if (isfinite(retrieved_aod[i]) && retrieved_aod[i] >= 0.0f)
+                        { s2 += retrieved_aod[i]; n2++; }
+                if (n2 > 0) {
+                    aod_val = (float)(s2 / n2);
+                    G_message(_("AOD after MAIAC patch: %.3f scene mean"), aod_val);
+                }
+            }
+        }
+
+        /* ── O₂-A per-pixel surface pressure ── */
+        if (flag_p->answer) {
+            int b740 = find_closest_band(cube_wl, ret_nbands, 0.740f);
+            int b760 = find_closest_band(cube_wl, ret_nbands, 0.760f);
+            int b780 = find_closest_band(cube_wl, ret_nbands, 0.780f);
+            G_message(_("Retrieving surface pressure (O₂-A) from bands "
+                        "%.0f/%.0f/%.0f nm..."),
+                      cube_wl[b740]*1000.0f, cube_wl[b760]*1000.0f,
+                      cube_wl[b780]*1000.0f);
+
+            float *L_740 = G_malloc(ret_npix * sizeof(float));
+            float *L_760 = G_malloc(ret_npix * sizeof(float));
+            float *L_780 = G_malloc(ret_npix * sizeof(float));
+            int   depths_p[3]  = {b740, b760, b780};
+            float *ptrs_p[3]   = {L_740, L_760, L_780};
+            load_bands_from_cube(ret_map, depths_p, 3,
+                                 ret_nrows, ret_ncols, ptrs_p);
+
+            retrieved_pressure = G_malloc(ret_npix * sizeof(float));
+            retrieve_pressure_o2a(L_740, L_760, L_780,
+                                   ret_npix, sza, vza, retrieved_pressure);
+            G_free(L_740); G_free(L_760); G_free(L_780);
+
+            /* Update cfg with scene-mean pressure (use for LUT if DEM not set) */
+            if (cfg.surface_pressure <= 0.0f) {
+                double sp = 0.0; int np = 0;
+                for (int i = 0; i < ret_npix; i++)
+                    if (isfinite(retrieved_pressure[i]))
+                        { sp += retrieved_pressure[i]; np++; }
+                if (np > 0) {
+                    cfg.surface_pressure = (float)(sp / np);
+                    G_message(_("O₂-A surface pressure: %.1f hPa (scene mean)"),
+                              cfg.surface_pressure);
+                }
+            }
+        }
+
+        /* ── Cloud / shadow / water / snow bitmask ── */
+        if (flag_m->answer) {
+            int b470  = find_closest_band(cube_wl, ret_nbands, 0.470f);
+            int b660  = find_closest_band(cube_wl, ret_nbands, 0.660f);
+            int b860  = find_closest_band(cube_wl, ret_nbands, 0.860f);
+            int b1600 = find_closest_band(cube_wl, ret_nbands, 1.600f);
+            G_message(_("Computing quality bitmask (cloud/shadow/water/snow)..."));
+
+            float *L_blue = G_malloc(ret_npix * sizeof(float));
+            float *L_red  = G_malloc(ret_npix * sizeof(float));
+            float *L_nir  = G_malloc(ret_npix * sizeof(float));
+            float *L_swir = NULL;
+            /* Load SWIR only if it's within the input cube wavelength range */
+            if (cube_wl[b1600] > 1.55f && cube_wl[b1600] < 1.65f)
+                L_swir = G_malloc(ret_npix * sizeof(float));
+            int   depths_m[4]  = {b470, b660, b860, b1600};
+            float *ptrs_m[4]   = {L_blue, L_red, L_nir,
+                                   L_swir ? L_swir : L_nir};  /* fallback */
+            int    n_m = L_swir ? 4 : 3;
+            load_bands_from_cube(ret_map, depths_m, n_m,
+                                 ret_nrows, ret_ncols, ptrs_m);
+
+            retrieved_quality = G_malloc(ret_npix * sizeof(uint8_t));
+            retrieve_quality_mask(L_blue, L_red, L_nir, L_swir,
+                                   ret_npix, doy, sza, retrieved_quality);
+            G_free(L_blue); G_free(L_red); G_free(L_nir); G_free(L_swir);
+
+            /* Report fractions */
+            int nc = 0, ns = 0, nw = 0, nsn = 0;
+            for (int i = 0; i < ret_npix; i++) {
+                if (retrieved_quality[i] & RETRIEVE_MASK_CLOUD)  nc++;
+                if (retrieved_quality[i] & RETRIEVE_MASK_SHADOW) ns++;
+                if (retrieved_quality[i] & RETRIEVE_MASK_WATER)  nw++;
+                if (retrieved_quality[i] & RETRIEVE_MASK_SNOW)   nsn++;
+            }
+            G_message(_("Quality mask: cloud=%.1f%% shadow=%.1f%% water=%.1f%% snow=%.1f%%"),
+                      100.0f * nc  / ret_npix,
+                      100.0f * ns  / ret_npix,
+                      100.0f * nw  / ret_npix,
+                      100.0f * nsn / ret_npix);
         }
 
         Rast3d_close(ret_map);
@@ -1222,16 +1644,17 @@ int main(int argc, char *argv[])
         }
     }
 
-    size_t n      = (size_t)n_aod * n_h2o * n_wl;
-    float *R_atm  = G_malloc(n * sizeof(float));
-    float *T_down = G_malloc(n * sizeof(float));
-    float *T_up   = G_malloc(n * sizeof(float));
-    float *s_alb  = G_malloc(n * sizeof(float));
+    size_t n          = (size_t)n_aod * n_h2o * n_wl;
+    float *R_atm      = G_malloc(n * sizeof(float));
+    float *T_down     = G_malloc(n * sizeof(float));
+    float *T_up       = G_malloc(n * sizeof(float));
+    float *s_alb      = G_malloc(n * sizeof(float));
+    float *T_down_dir = do_terrain ? G_malloc(n * sizeof(float)) : NULL;
 
     for (size_t i = 0; i < n; i++) {
         R_atm[i] = 0.f; T_down[i] = 1.f; T_up[i] = 1.f; s_alb[i] = 0.f;
     }
-    LutArrays lut = { R_atm, T_down, T_up, s_alb };
+    LutArrays lut = { R_atm, T_down, T_up, s_alb, T_down_dir, NULL, NULL };
 
     /* ── Compute LUT ── */
     G_verbose_message(_("Computing LUT: %d AOD × %d H2O × %d wavelengths "
@@ -1256,6 +1679,126 @@ int main(int argc, char *argv[])
                     "R_atm=%.4f  T_down=%.4f  T_up=%.4f  s_alb=%.4f"),
                   wl_buf[i550], aod_buf[ia], h2o_buf[ih],
                   R_atm[idx], T_down[idx], T_up[idx], s_alb[idx]);
+    }
+
+    /* ── Joint OE retrieval of per-pixel AOD + H₂O (requires LUT) ── *
+     * Runs after atcorr_compute_lut; supersedes independent -a/-w retrievals
+     * when -e is active.  Uses the pre-loaded cube bands for VIS spectral
+     * smoothness and NIR H₂O constraints. */
+    if (opt_input->answer && flag_e->answer) {
+        const char *oe_mapset = G_find_raster3d(opt_input->answer, "");
+        if (!oe_mapset)
+            G_fatal_error(_("Cannot find input cube <%s> for OE"), opt_input->answer);
+
+        RASTER3D_Region oe_reg; Rast3d_get_window(&oe_reg);
+        RASTER3D_Map *oe_map = Rast3d_open_cell_old(
+            opt_input->answer, oe_mapset, &oe_reg,
+            RASTER3D_TILE_SAME_AS_FILE, RASTER3D_USE_CACHE_DEFAULT);
+        if (!oe_map)
+            G_fatal_error(_("Cannot open input cube <%s> for OE"), opt_input->answer);
+        Rast3d_get_region_struct_map(oe_map, &oe_reg);
+
+        int oe_nrows  = oe_reg.rows;
+        int oe_ncols  = oe_reg.cols;
+        int oe_nbands = oe_reg.depths;
+        int oe_npix   = oe_nrows * oe_ncols;
+
+        float *oe_wl   = G_malloc(oe_nbands * sizeof(float));
+        float *oe_fwhm = G_malloc(oe_nbands * sizeof(float));
+        int    n_oe_parsed = parse_band_wl(opt_input->answer, oe_wl, oe_fwhm,
+                                            oe_nbands);
+        G_free(oe_fwhm);
+        if (n_oe_parsed == 0)
+            for (int b = 0; b < oe_nbands && b < n_wl; b++)
+                oe_wl[b] = wl_buf[b];
+
+        /* Select VIS diagnostic bands: 470, 550, 660, 870 nm */
+        static const float VIS_TARGETS[] = {0.470f, 0.550f, 0.660f, 0.870f};
+        static const int   N_VIS = 4;
+        int   vis_bands[4];
+        float vis_wl[4];
+        for (int b = 0; b < N_VIS; b++) {
+            vis_bands[b] = find_closest_band(oe_wl, oe_nbands, VIS_TARGETS[b]);
+            vis_wl[b]    = VIS_TARGETS[b];
+        }
+
+        /* NIR bands for H₂O constraint */
+        int b865  = find_closest_band(oe_wl, oe_nbands, 0.865f);
+        int b940  = find_closest_band(oe_wl, oe_nbands, 0.940f);
+        int b1040 = find_closest_band(oe_wl, oe_nbands, 1.040f);
+
+        G_message(_("OE retrieval: VIS bands %.0f/%.0f/%.0f/%.0f nm; "
+                    "H2O bands %.0f/%.0f/%.0f nm..."),
+                  oe_wl[vis_bands[0]]*1000.f, oe_wl[vis_bands[1]]*1000.f,
+                  oe_wl[vis_bands[2]]*1000.f, oe_wl[vis_bands[3]]*1000.f,
+                  oe_wl[b865]*1000.f, oe_wl[b940]*1000.f, oe_wl[b1040]*1000.f);
+
+        /* Load bands into [npix × N_VIS] interleaved array */
+        float *oe_vis_buf[4];
+        for (int b = 0; b < N_VIS; b++)
+            oe_vis_buf[b] = G_malloc(oe_npix * sizeof(float));
+        load_bands_from_cube(oe_map, vis_bands, N_VIS,
+                             oe_nrows, oe_ncols, oe_vis_buf);
+
+        float *rho_toa_vis = G_malloc((size_t)oe_npix * N_VIS * sizeof(float));
+        double d2_oe = sixs_earth_sun_dist2(doy);
+        float  cos_sza_oe = cosf(sza * (float)(M_PI / 180.0));
+        if (cos_sza_oe < 0.05f) cos_sza_oe = 0.05f;
+        for (int b = 0; b < N_VIS; b++) {
+            float E0_b = sixs_E0(vis_wl[b]);
+            for (int i = 0; i < oe_npix; i++) {
+                float L = oe_vis_buf[b][i];
+                rho_toa_vis[i * N_VIS + b] =
+                    isfinite(L) ? (float)(M_PI * L * d2_oe) / (E0_b * cos_sza_oe)
+                                : NAN;
+            }
+            G_free(oe_vis_buf[b]);
+        }
+
+        /* Load H₂O bands */
+        float *L_865  = G_malloc(oe_npix * sizeof(float));
+        float *L_940  = G_malloc(oe_npix * sizeof(float));
+        float *L_1040 = G_malloc(oe_npix * sizeof(float));
+        int   depths_oe_h2o[3]  = {b865, b940, b1040};
+        float *ptrs_oe_h2o[3]   = {L_865, L_940, L_1040};
+        load_bands_from_cube(oe_map, depths_oe_h2o, 3,
+                             oe_nrows, oe_ncols, ptrs_oe_h2o);
+
+        /* Allocate OE output (override any previous DDV/940nm retrievals) */
+        G_free(retrieved_aod); G_free(retrieved_h2o);
+        retrieved_aod = G_malloc(oe_npix * sizeof(float));
+        retrieved_h2o = G_malloc(oe_npix * sizeof(float));
+
+        float sigma_aod_oe  = (float)atof(opt_oe_sigma_aod->answer);
+        float sigma_h2o_oe  = (float)atof(opt_oe_sigma_h2o->answer);
+
+        oe_invert_aod_h2o(&cfg, &lut,
+                           rho_toa_vis, oe_npix, N_VIS, vis_wl,
+                           L_865, L_940, L_1040,
+                           sza, vza,
+                           aod_val, h2o_val,
+                           sigma_aod_oe, sigma_h2o_oe,
+                           0.01f,  /* sigma_spec = 1% reflectance */
+                           retrieved_aod, retrieved_h2o);
+
+        G_free(rho_toa_vis);
+        G_free(L_865); G_free(L_940); G_free(L_1040);
+        Rast3d_close(oe_map);
+        G_free(oe_wl);
+
+        /* Update scene-mean AOD/H₂O from OE results */
+        double sa = 0.0, sh = 0.0; int ne = 0;
+        for (int i = 0; i < oe_npix; i++) {
+            if (isfinite(retrieved_aod[i]) && isfinite(retrieved_h2o[i])) {
+                sa += retrieved_aod[i]; sh += retrieved_h2o[i]; ne++;
+            }
+        }
+        if (ne > 0) {
+            aod_val = (float)(sa / ne);
+            h2o_val = (float)(sh / ne);
+            G_message(_("OE retrieval complete: AOD=%.3f H₂O=%.2f g/cm² (scene means)"),
+                      aod_val, h2o_val);
+        }
     }
 
     /* ── Write LUT file ── */
@@ -1294,6 +1837,11 @@ int main(int argc, char *argv[])
         float adj = (float)atof(opt_adj_psf->answer);
         if (adj > 0.0f)
             G_message(_("Adjacency correction: PSF=%.2f km"), adj);
+        if (do_terrain)
+            G_message(_("Terrain illumination correction: ENABLED "
+                        "(sun_azimuth=%.1f°)"), sun_azimuth);
+        if (do_nbar)
+            G_message(_("NBAR normalization: ENABLED (Ross-Li MCD43 kernels)"));
         if (flag_r->answer)
             G_message(_("Surface prior MAP regularisation: ENABLED"));
         if (flag_u->answer)
@@ -1311,16 +1859,61 @@ int main(int argc, char *argv[])
             .do_uncertainty = flag_u->answer ? 1 : 0,
             .unc_output     = (flag_u->answer && opt_uncertainty->answer)
                               ? opt_uncertainty->answer : NULL,
+            .slope_map      = opt_slope->answer,
+            .aspect_map     = opt_aspect->answer,
+            .sun_azimuth    = sun_azimuth,
+            .vza_map        = opt_vza_map->answer,
+            .vaa_map        = opt_vaa_map->answer,
+            .brdf_fiso_map  = do_nbar ? opt_fiso->answer : NULL,
+            .brdf_fvol_map  = do_nbar ? opt_fvol->answer : NULL,
+            .brdf_fgeo_map  = do_nbar ? opt_fgeo->answer : NULL,
+            .pressure_data  = retrieved_pressure,
+            .quality_data   = retrieved_quality,
         };
+
+        if (flag_p->answer && retrieved_pressure)
+            G_message(_("Per-pixel O₂-A pressure correction: ENABLED"));
+        if (flag_m->answer && retrieved_quality)
+            G_message(_("Pre-correction quality bitmask: ENABLED"));
 
         correct_raster3d(opt_input->answer, opt_output->answer,
                          &cfg, &lut, aod_val, h2o_val, doy, sza, &iso);
+
+        /* ── Write quality bitmask as 2-D GRASS raster ── */
+        if (flag_m->answer && retrieved_quality && opt_quality->answer) {
+            G_message(_("Writing quality bitmask to <%s>..."), opt_quality->answer);
+
+            struct Cell_head win_q;
+            G_get_window(&win_q);
+            int q_nrows = win_q.rows, q_ncols = win_q.cols;
+
+            int fd_q = Rast_open_new(opt_quality->answer, CELL_TYPE);
+            CELL *q_row = Rast_allocate_c_buf();
+            for (int r = 0; r < q_nrows; r++) {
+                for (int c = 0; c < q_ncols; c++) {
+                    int idx = r * q_ncols + c;
+                    if (idx < q_nrows * q_ncols)
+                        q_row[c] = (CELL)retrieved_quality[idx];
+                    else
+                        Rast_set_c_null_value(&q_row[c], 1);
+                }
+                Rast_put_c_row(fd_q, q_row);
+            }
+            G_free(q_row);
+            Rast_close(fd_q);
+            G_message(_("Quality bitmask written to <%s> "
+                        "(bit 0=cloud, 1=shadow, 2=water, 3=snow)"),
+                      opt_quality->answer);
+        }
     }
 
     G_free(retrieved_aod);
     G_free(retrieved_h2o);
+    G_free(retrieved_pressure);
+    G_free(retrieved_quality);
     G_free(wl_buf);
     G_free(R_atm); G_free(T_down); G_free(T_up); G_free(s_alb);
+    G_free(T_down_dir);
 
     exit(EXIT_SUCCESS);
 }

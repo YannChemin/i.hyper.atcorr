@@ -1,21 +1,45 @@
-"""Python ctypes bindings for libatcorr.so (6SV2.1-based atmospheric correction).
+"""Python ctypes bindings for ``libatcorr.so`` (6SV2.1-based atmospheric correction).
 
-Usage:
-    from atcorr import LutConfig, LutArrays, compute_lut, lut_slice, invert, solar_E0, earth_sun_dist2
+This module loads ``libatcorr.so`` from the GRASS add-on installation directory
+(``$GISBASE/lib/``) or from the build tree.  It exposes the full public C API
+as Python functions backed by NumPy arrays.
+
+Public API
+----------
+- :class:`LutConfig`         — LUT grid specification and scene geometry.
+- :class:`LutArrays`         — LUT output arrays shaped ``[n_aod, n_h2o, n_wl]``.
+- :func:`compute_lut`        — Build the 3-D atmospheric correction LUT.
+- :func:`lut_slice`          — Bilinear interpolation at a fixed (AOD, H₂O) point.
+- :func:`invert`             — Lambertian BOA reflectance inversion.
+- :func:`solar_E0`           — Thuillier solar irradiance spectrum.
+- :func:`earth_sun_dist2`    — Seasonal Earth–Sun distance.
+- :func:`apply_srf_correction` — SRF gas-transmittance correction via libRadtran.
+- :func:`retrieve_pressure_isa` — ISA surface pressure from elevation.
+- :func:`retrieve_h2o_940`   — H₂O column from 940 nm band depth.
+- :func:`retrieve_o3_chappuis` — O₃ column from Chappuis band depth.
+- :func:`retrieve_aod_ddv`   — AOD from MODIS dark-target DDV.
+- :func:`retrieve_pressure_o2a` — Surface pressure from O₂-A band depth.
+- :func:`retrieve_quality_mask` — Cloud/shadow/water/snow bitmask.
+- :func:`retrieve_aod_maiac` — Patch-median AOD spatial regularisation.
+- :func:`oe_invert_aod_h2o`  — Joint AOD + H₂O optimal-estimation retrieval.
+
+Quick-start example::
+
+    import numpy as np
+    from atcorr import LutConfig, compute_lut, lut_slice, invert
 
     cfg = LutConfig(
-        wl=np.array([0.45, 0.55, 0.65, 0.85], dtype=np.float32),
-        aod=np.array([0.05, 0.1, 0.2, 0.4], dtype=np.float32),
-        h2o=np.array([1.0, 2.0, 3.0, 5.0], dtype=np.float32),
-        sza=30.0, vza=5.0, raa=90.0,
-        altitude_km=1000.0,   # satellite
-        atmo_model=1,         # US62
+        wl=np.array([0.45, 0.55, 0.65, 0.87], dtype=np.float32),
+        aod=np.array([0.0, 0.2, 0.6],          dtype=np.float32),
+        h2o=np.array([1.0, 3.0],               dtype=np.float32),
+        sza=35.0, vza=5.0, raa=90.0,
+        altitude_km=1000.0,   # satellite orbit
+        atmo_model=1,         # US Standard 1962
         aerosol_model=1,      # continental
-        surface_pressure=0.0,
-        ozone_du=300.0,
     )
-    lut = compute_lut(cfg)
-    # lut.R_atm, lut.T_down, lut.T_up, lut.s_alb are numpy arrays [n_aod, n_h2o, n_wl]
+    lut  = compute_lut(cfg)        # LutArrays [3, 2, 4]
+    sl   = lut_slice(cfg, lut, aod_val=0.15, h2o_val=2.0)  # 1-D [4]
+    rho  = invert(rho_toa, sl.R_atm, sl.T_down, sl.T_up, sl.s_alb)
 """
 
 import ctypes
@@ -72,15 +96,20 @@ class _LutConfigC(ctypes.Structure):
         # BRDF fields (Phase 5): brdf_type (int) + brdf_params (union, 5 floats)
         ("brdf_type",        ctypes.c_int),
         ("brdf_params",      ctypes.c_float * 5),
+        # Polarization (Phase 6): 0=scalar RT, 1=Stokes(I,Q,U)
+        ("enable_polar",     ctypes.c_int),
     ]
 
 
 class _LutArraysC(ctypes.Structure):
     _fields_ = [
-        ("R_atm",  ctypes.POINTER(ctypes.c_float)),
-        ("T_down", ctypes.POINTER(ctypes.c_float)),
-        ("T_up",   ctypes.POINTER(ctypes.c_float)),
-        ("s_alb",  ctypes.POINTER(ctypes.c_float)),
+        ("R_atm",      ctypes.POINTER(ctypes.c_float)),
+        ("T_down",     ctypes.POINTER(ctypes.c_float)),
+        ("T_up",       ctypes.POINTER(ctypes.c_float)),
+        ("s_alb",      ctypes.POINTER(ctypes.c_float)),
+        ("T_down_dir", ctypes.POINTER(ctypes.c_float)),  # NULL unless terrain requested
+        ("R_atmQ",     ctypes.POINTER(ctypes.c_float)),  # NULL unless enable_polar=1
+        ("R_atmU",     ctypes.POINTER(ctypes.c_float)),  # NULL unless enable_polar=1
     ]
 
 
@@ -105,15 +134,17 @@ _lib.atcorr_lut_slice.argtypes = [
     ctypes.POINTER(_LutArraysC),
     ctypes.c_float,                          # aod_val
     ctypes.c_float,                          # h2o_val
-    ctypes.POINTER(ctypes.c_float),          # Rs  [n_wl]
-    ctypes.POINTER(ctypes.c_float),          # Tds [n_wl]
-    ctypes.POINTER(ctypes.c_float),          # Tus [n_wl]
-    ctypes.POINTER(ctypes.c_float),          # ss  [n_wl]
+    ctypes.POINTER(ctypes.c_float),          # Rs   [n_wl]
+    ctypes.POINTER(ctypes.c_float),          # Tds  [n_wl]
+    ctypes.POINTER(ctypes.c_float),          # Tus  [n_wl]
+    ctypes.POINTER(ctypes.c_float),          # ss   [n_wl]
+    ctypes.POINTER(ctypes.c_float),          # Tdds [n_wl] or NULL
 ]
 _lib.atcorr_lut_slice.restype = None
 
 
 def version() -> str:
+    """Return the libatcorr version string (e.g. ``'1.0.0'``)."""
     return _lib.atcorr_version().decode()
 
 
@@ -132,8 +163,19 @@ def solar_E0(wl_um):
     return float(out[0]) if scalar else out
 
 
-def earth_sun_dist2(doy):
-    """Squared Earth-Sun distance d² in AU for day-of-year (1–365)."""
+def earth_sun_dist2(doy: int) -> float:
+    """Squared Earth–Sun distance d² [AU²] for a given day of year.
+
+    Parameters
+    ----------
+    doy : int
+        Day of year [1, 365].
+
+    Returns
+    -------
+    float
+        d² in AU² (< 1 near perihelion DOY≈3, > 1 near aphelion DOY≈185).
+    """
     return _lib.sixs_earth_sun_dist2(int(doy))
 
 
@@ -159,7 +201,8 @@ class LutConfig:
                  sza=30.0, vza=5.0, raa=90.0,
                  altitude_km=1000.0,
                  atmo_model=1, aerosol_model=1,
-                 surface_pressure=0.0, ozone_du=300.0):
+                 surface_pressure=0.0, ozone_du=300.0,
+                 enable_polar=0):
         self.wl   = np.asarray(wl,  dtype=np.float32)
         self.aod  = np.asarray(aod, dtype=np.float32)
         self.h2o  = np.asarray(h2o, dtype=np.float32)
@@ -171,21 +214,46 @@ class LutConfig:
         self.aerosol_model    = int(aerosol_model)
         self.surface_pressure = float(surface_pressure)
         self.ozone_du         = float(ozone_du)
+        self.enable_polar     = int(enable_polar)
 
 
 class LutArrays:
-    """Output from compute_lut: numpy arrays shaped [n_aod, n_h2o, n_wl]."""
-    def __init__(self, R_atm, T_down, T_up, s_alb):
+    """Output from compute_lut: numpy arrays shaped [n_aod, n_h2o, n_wl].
+
+    R_atmQ and R_atmU are the Q and U Stokes components of the atmospheric
+    path reflectance.  They are None unless enable_polar=1 was set in LutConfig.
+    """
+    def __init__(self, R_atm, T_down, T_up, s_alb, R_atmQ=None, R_atmU=None):
         self.R_atm  = R_atm
         self.T_down = T_down
         self.T_up   = T_up
         self.s_alb  = s_alb
+        self.R_atmQ = R_atmQ
+        self.R_atmU = R_atmU
 
 
 def compute_lut(cfg: LutConfig) -> LutArrays:
-    """Compute a full atmospheric correction LUT.
+    """Compute a full 3-D atmospheric correction LUT via DISCOM.
 
-    Returns LutArrays with R_atm, T_down, T_up, s_alb shaped [n_aod, n_h2o, n_wl].
+    Allocates output arrays and calls :c:func:`atcorr_compute_lut` (OpenMP
+    parallelised over the AOD grid).
+
+    Parameters
+    ----------
+    cfg : LutConfig
+        LUT grid specification and scene geometry.
+
+    Returns
+    -------
+    LutArrays
+        ``R_atm``, ``T_down``, ``T_up``, ``s_alb`` shaped ``[n_aod, n_h2o, n_wl]``.
+        ``R_atmQ`` and ``R_atmU`` are populated when ``cfg.enable_polar=1``,
+        ``None`` otherwise.
+
+    Raises
+    ------
+    RuntimeError
+        If the C library returns a non-zero error code.
     """
     n_aod = len(cfg.aod)
     n_h2o = len(cfg.h2o)
@@ -197,6 +265,11 @@ def compute_lut(cfg: LutConfig) -> LutArrays:
     T_down = np.ones(n,  dtype=np.float32)
     T_up   = np.ones(n,  dtype=np.float32)
     s_alb  = np.zeros(n, dtype=np.float32)
+
+    # Polarization Q/U arrays (only when enable_polar=1)
+    enable_polar = getattr(cfg, 'enable_polar', 0)
+    R_atmQ = np.zeros(n, dtype=np.float32) if enable_polar else None
+    R_atmU = np.zeros(n, dtype=np.float32) if enable_polar else None
 
     # Build C structs
     c_cfg = _LutConfigC(
@@ -214,12 +287,16 @@ def compute_lut(cfg: LutConfig) -> LutArrays:
         aerosol_model    = cfg.aerosol_model,
         surface_pressure = cfg.surface_pressure,
         ozone_du         = cfg.ozone_du,
+        enable_polar     = enable_polar,
     )
     c_out = _LutArraysC(
-        R_atm  = R_atm.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        T_down = T_down.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        T_up   = T_up.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        s_alb  = s_alb.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        R_atm      = R_atm.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_down     = T_down.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_up       = T_up.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        s_alb      = s_alb.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_down_dir = None,  # not requested in Python API
+        R_atmQ     = R_atmQ.ctypes.data_as(ctypes.POINTER(ctypes.c_float)) if R_atmQ is not None else None,
+        R_atmU     = R_atmU.ctypes.data_as(ctypes.POINTER(ctypes.c_float)) if R_atmU is not None else None,
     )
 
     ret = _lib.atcorr_compute_lut(ctypes.byref(c_cfg), ctypes.byref(c_out))
@@ -232,6 +309,8 @@ def compute_lut(cfg: LutConfig) -> LutArrays:
         T_down = T_down.reshape(shape),
         T_up   = T_up.reshape(shape),
         s_alb  = s_alb.reshape(shape),
+        R_atmQ = R_atmQ.reshape(shape) if R_atmQ is not None else None,
+        R_atmU = R_atmU.reshape(shape) if R_atmU is not None else None,
     )
 
 
@@ -270,10 +349,11 @@ def lut_slice(cfg: LutConfig, arrays: LutArrays,
         surface_pressure=cfg.surface_pressure, ozone_du=cfg.ozone_du,
     )
     c_arr = _LutArraysC(
-        R_atm =Ra.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        T_down=Td.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        T_up  =Tu.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        s_alb =sa.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        R_atm     =Ra.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_down    =Td.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_up      =Tu.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        s_alb     =sa.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_down_dir=None,
     )
     _lib.atcorr_lut_slice(
         ctypes.byref(c_cfg), ctypes.byref(c_arr),
@@ -282,14 +362,34 @@ def lut_slice(cfg: LutConfig, arrays: LutArrays,
         Tds.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         Tus.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         ss.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        None,  # Tdds: not requested
     )
     return LutArrays(Rs, Tds, Tus, ss)
 
 
 def invert(rho_toa, R_atm, T_down, T_up, s_alb):
-    """Invert TOA reflectance to surface (BOA) reflectance.
+    """Lambertian BOA reflectance inversion (Python/NumPy implementation).
 
-    All arrays must be broadcastable. Returns surface reflectance.
+    Equivalent to :c:func:`atcorr_invert` but operates on NumPy arrays.
+    All inputs must be broadcastable to a common shape.
+
+    Parameters
+    ----------
+    rho_toa : array-like
+        TOA reflectance.
+    R_atm : array-like
+        Atmospheric path reflectance (LUT value).
+    T_down : array-like
+        Downward transmittance.
+    T_up : array-like
+        Upward transmittance.
+    s_alb : array-like
+        Spherical albedo.
+
+    Returns
+    -------
+    numpy.ndarray
+        Surface (BOA) reflectance.
     """
     y = (rho_toa - R_atm) / (T_down * T_up + 1e-10)
     return y / (1.0 + s_alb * y + 1e-10)
@@ -380,10 +480,11 @@ def apply_srf_correction(cfg: LutConfig, arrays: LutArrays,
     assert len(Td) == n
 
     c_arr = _LutArraysC(
-        R_atm =Ra.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        T_down=Td.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        T_up  =Tu.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        s_alb =sa.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        R_atm      =Ra.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_down     =Td.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_up       =Tu.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        s_alb      =sa.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_down_dir =None,
     )
 
     srf = _lib.atcorr_srf_compute(ctypes.byref(c_srf_cfg), ctypes.byref(c_cfg))
@@ -403,3 +504,364 @@ def apply_srf_correction(cfg: LutConfig, arrays: LutArrays,
         T_up   = Tu.reshape(shape),
         s_alb  = sa.reshape(shape),
     )
+
+
+# ── Retrieval functions ───────────────────────────────────────────────────────
+
+# Function signatures for new retrieval functions
+_lib.retrieve_pressure_o2a.argtypes = [
+    ctypes.POINTER(ctypes.c_float),  # L_740
+    ctypes.POINTER(ctypes.c_float),  # L_760
+    ctypes.POINTER(ctypes.c_float),  # L_780
+    ctypes.c_int,                    # npix
+    ctypes.c_float,                  # sza_deg
+    ctypes.c_float,                  # vza_deg
+    ctypes.POINTER(ctypes.c_float),  # out_pressure
+]
+_lib.retrieve_pressure_o2a.restype = None
+
+_lib.retrieve_quality_mask.argtypes = [
+    ctypes.POINTER(ctypes.c_float),  # L_blue
+    ctypes.POINTER(ctypes.c_float),  # L_red
+    ctypes.POINTER(ctypes.c_float),  # L_nir
+    ctypes.POINTER(ctypes.c_float),  # L_swir (may be NULL)
+    ctypes.c_int,                    # npix
+    ctypes.c_int,                    # doy
+    ctypes.c_float,                  # sza_deg
+    ctypes.POINTER(ctypes.c_uint8),  # out_mask
+]
+_lib.retrieve_quality_mask.restype = None
+
+_lib.retrieve_aod_maiac.argtypes = [
+    ctypes.POINTER(ctypes.c_float),  # aod_data (in-place)
+    ctypes.c_int,                    # nrows
+    ctypes.c_int,                    # ncols
+    ctypes.c_int,                    # patch_sz
+]
+_lib.retrieve_aod_maiac.restype = None
+
+_lib.oe_invert_aod_h2o.argtypes = [
+    ctypes.POINTER(_LutConfigC),     # cfg
+    ctypes.POINTER(_LutArraysC),     # lut
+    ctypes.POINTER(ctypes.c_float),  # rho_toa_vis [npix × n_vis]
+    ctypes.c_int,                    # npix
+    ctypes.c_int,                    # n_vis
+    ctypes.POINTER(ctypes.c_float),  # vis_wl [n_vis]
+    ctypes.POINTER(ctypes.c_float),  # L_865 (or NULL)
+    ctypes.POINTER(ctypes.c_float),  # L_940 (or NULL)
+    ctypes.POINTER(ctypes.c_float),  # L_1040 (or NULL)
+    ctypes.c_float,                  # sza_deg
+    ctypes.c_float,                  # vza_deg
+    ctypes.c_float,                  # aod_prior
+    ctypes.c_float,                  # h2o_prior
+    ctypes.c_float,                  # sigma_aod
+    ctypes.c_float,                  # sigma_h2o
+    ctypes.c_float,                  # sigma_spec
+    ctypes.POINTER(ctypes.c_float),  # out_aod
+    ctypes.POINTER(ctypes.c_float),  # out_h2o
+]
+_lib.oe_invert_aod_h2o.restype = None
+
+# ── Basic retrieval function signatures ───────────────────────────────────────
+_lib.retrieve_pressure_isa.argtypes = [ctypes.c_float]
+_lib.retrieve_pressure_isa.restype  = ctypes.c_float
+
+_lib.retrieve_h2o_940.argtypes = [
+    ctypes.POINTER(ctypes.c_float),  # L_865
+    ctypes.POINTER(ctypes.c_float),  # L_940
+    ctypes.POINTER(ctypes.c_float),  # L_1040
+    ctypes.c_int,                    # npix
+    ctypes.c_float,                  # sza_deg
+    ctypes.c_float,                  # vza_deg
+    ctypes.POINTER(ctypes.c_float),  # out_wvc
+]
+_lib.retrieve_h2o_940.restype = None
+
+_lib.retrieve_o3_chappuis.argtypes = [
+    ctypes.POINTER(ctypes.c_float),  # L_540
+    ctypes.POINTER(ctypes.c_float),  # L_600
+    ctypes.POINTER(ctypes.c_float),  # L_680
+    ctypes.c_int,                    # npix
+    ctypes.c_float,                  # sza_deg
+    ctypes.c_float,                  # vza_deg
+]
+_lib.retrieve_o3_chappuis.restype = ctypes.c_float
+
+_lib.retrieve_aod_ddv.argtypes = [
+    ctypes.POINTER(ctypes.c_float),  # L_470
+    ctypes.POINTER(ctypes.c_float),  # L_660
+    ctypes.POINTER(ctypes.c_float),  # L_860
+    ctypes.POINTER(ctypes.c_float),  # L_2130
+    ctypes.c_int,                    # npix
+    ctypes.c_int,                    # doy
+    ctypes.c_float,                  # sza_deg
+    ctypes.POINTER(ctypes.c_float),  # out_aod
+]
+_lib.retrieve_aod_ddv.restype = ctypes.c_float
+
+
+def retrieve_pressure_isa(elev_m):
+    """Surface pressure [hPa] from elevation (m) using ISA barometric formula.
+
+    Valid range: 0–11 000 m; clamped at boundaries.
+    """
+    return float(_lib.retrieve_pressure_isa(ctypes.c_float(float(elev_m))))
+
+
+def retrieve_h2o_940(L_865, L_940, L_1040, sza_deg, vza_deg):
+    """Per-pixel water vapour column [g/cm²] from 940 nm band depth.
+
+    Parameters
+    ----------
+    L_865, L_940, L_1040 : 1-D float32 arrays [npix]
+        TOA radiance at ~865, 940, 1040 nm.
+    sza_deg, vza_deg : float
+
+    Returns
+    -------
+    wvc : float32 array [npix]  in g/cm² ∈ [0.1, 8.0]
+    """
+    L_865  = np.ascontiguousarray(L_865,  dtype=np.float32)
+    L_940  = np.ascontiguousarray(L_940,  dtype=np.float32)
+    L_1040 = np.ascontiguousarray(L_1040, dtype=np.float32)
+    npix   = len(L_865)
+    out    = np.empty(npix, dtype=np.float32)
+    _lib.retrieve_h2o_940(
+        L_865.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_940.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_1040.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        npix, float(sza_deg), float(vza_deg),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return out
+
+
+def retrieve_o3_chappuis(L_540, L_600, L_680, sza_deg, vza_deg):
+    """Scene-mean O₃ column [DU] from Chappuis band depth at 600 nm.
+
+    Returns scene mean in [50, 800] DU; fallback 300 DU if no signal.
+    """
+    L_540 = np.ascontiguousarray(L_540, dtype=np.float32)
+    L_600 = np.ascontiguousarray(L_600, dtype=np.float32)
+    L_680 = np.ascontiguousarray(L_680, dtype=np.float32)
+    npix  = len(L_540)
+    return float(_lib.retrieve_o3_chappuis(
+        L_540.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_600.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_680.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        npix, float(sza_deg), float(vza_deg),
+    ))
+
+
+def retrieve_aod_ddv(L_470, L_660, L_860, L_2130, doy, sza_deg):
+    """Scene-mean AOD@550nm and per-pixel AOD from MODIS DDV method.
+
+    Parameters
+    ----------
+    L_470, L_660, L_860, L_2130 : 1-D float32 arrays [npix]
+    doy : int  Day of year.
+    sza_deg : float
+
+    Returns
+    -------
+    scene_mean : float  Scene-mean AOD at 550 nm (0.15 if no DDV pixels).
+    aod_px     : float32 array [npix]
+    """
+    L_470  = np.ascontiguousarray(L_470,  dtype=np.float32)
+    L_660  = np.ascontiguousarray(L_660,  dtype=np.float32)
+    L_860  = np.ascontiguousarray(L_860,  dtype=np.float32)
+    L_2130 = np.ascontiguousarray(L_2130, dtype=np.float32)
+    npix   = len(L_470)
+    out    = np.empty(npix, dtype=np.float32)
+    scene_mean = float(_lib.retrieve_aod_ddv(
+        L_470.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_660.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_860.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_2130.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        npix, int(doy), float(sza_deg),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    ))
+    return scene_mean, out
+
+
+# Bitmask constants
+MASK_CLOUD  = 0x01
+MASK_SHADOW = 0x02
+MASK_WATER  = 0x04
+MASK_SNOW   = 0x08
+
+
+def retrieve_pressure_o2a(L_740, L_760, L_780, sza_deg, vza_deg):
+    """Per-pixel surface pressure from O₂-A band depth at 760 nm.
+
+    Parameters
+    ----------
+    L_740, L_760, L_780 : 1-D float32 arrays [npix]
+        TOA radiance at ~740, 760, 780 nm.
+    sza_deg, vza_deg : float
+        Solar and view zenith angles.
+
+    Returns
+    -------
+    pressure : float32 array [npix]  in hPa ∈ [200, 1100]
+    """
+    L_740 = np.ascontiguousarray(L_740, dtype=np.float32)
+    L_760 = np.ascontiguousarray(L_760, dtype=np.float32)
+    L_780 = np.ascontiguousarray(L_780, dtype=np.float32)
+    npix  = len(L_740)
+    out   = np.empty(npix, dtype=np.float32)
+    _lib.retrieve_pressure_o2a(
+        L_740.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_760.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_780.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        npix, float(sza_deg), float(vza_deg),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return out
+
+
+def retrieve_quality_mask(L_blue, L_red, L_nir, doy, sza_deg, L_swir=None):
+    """Pre-correction quality bitmask (cloud/shadow/water/snow).
+
+    Parameters
+    ----------
+    L_blue, L_red, L_nir : 1-D float32 arrays [npix]
+        TOA radiance at ~470, 660, 860 nm.
+    doy : int
+        Day of year.
+    sza_deg : float
+        Solar zenith angle.
+    L_swir : 1-D float32 array [npix] or None
+        TOA radiance at ~1600 nm (for NDSI/snow test).
+
+    Returns
+    -------
+    mask : uint8 array [npix]
+        Bitmask: MASK_CLOUD=0x01, MASK_SHADOW=0x02, MASK_WATER=0x04, MASK_SNOW=0x08
+    """
+    L_blue = np.ascontiguousarray(L_blue, dtype=np.float32)
+    L_red  = np.ascontiguousarray(L_red,  dtype=np.float32)
+    L_nir  = np.ascontiguousarray(L_nir,  dtype=np.float32)
+    npix   = len(L_blue)
+    out    = np.zeros(npix, dtype=np.uint8)
+
+    swir_ptr = None
+    if L_swir is not None:
+        L_swir  = np.ascontiguousarray(L_swir, dtype=np.float32)
+        swir_ptr = L_swir.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+    _lib.retrieve_quality_mask(
+        L_blue.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_red.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_nir.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        swir_ptr,
+        npix, int(doy), float(sza_deg),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+    )
+    return out
+
+
+def retrieve_aod_maiac(aod_data, nrows, ncols, patch_sz=32):
+    """MAIAC-inspired patch AOD spatial regularization (in-place).
+
+    Parameters
+    ----------
+    aod_data : float32 array [nrows × ncols]
+        Per-pixel AOD from retrieve_aod_ddv(); modified in place.
+    nrows, ncols : int
+    patch_sz : int
+        Patch size in pixels (default 32).
+    """
+    aod_flat = np.ascontiguousarray(aod_data.ravel(), dtype=np.float32)
+    _lib.retrieve_aod_maiac(
+        aod_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(nrows), int(ncols), int(patch_sz),
+    )
+    aod_data[:] = aod_flat.reshape(aod_data.shape)
+
+
+def oe_invert_aod_h2o(cfg, lut_arrays, rho_toa_vis, vis_wl,
+                       sza_deg, vza_deg,
+                       aod_prior, h2o_prior,
+                       sigma_aod=0.5, sigma_h2o=1.0, sigma_spec=0.01,
+                       L_865=None, L_940=None, L_1040=None):
+    """Joint per-pixel AOD + H₂O MAP retrieval via grid-search OE.
+
+    Parameters
+    ----------
+    cfg : LutConfig
+    lut_arrays : LutArrays
+    rho_toa_vis : float32 array [npix, n_vis]
+        TOA reflectance at aerosol-diagnostic bands.
+    vis_wl : float32 array [n_vis]
+        Wavelengths of VIS diagnostic bands (µm).
+    sza_deg, vza_deg : float
+    aod_prior, h2o_prior : float
+        Scene-mean prior state.
+    sigma_aod, sigma_h2o, sigma_spec : float
+        Prior and observation uncertainties.
+    L_865, L_940, L_1040 : float32 array [npix] or None
+        H₂O constraint bands (NIR radiance).
+
+    Returns
+    -------
+    aod_px : float32 array [npix]
+    h2o_px : float32 array [npix]
+    """
+    rho_vis = np.ascontiguousarray(rho_toa_vis, dtype=np.float32)
+    npix    = rho_vis.shape[0]
+    n_vis   = rho_vis.shape[1]
+    vis_wl_ = np.ascontiguousarray(vis_wl, dtype=np.float32)
+
+    n_wl  = len(cfg.wl)
+    n_aod = len(cfg.aod)
+    n_h2o = len(cfg.h2o)
+    n     = n_aod * n_h2o * n_wl
+
+    c_cfg = _LutConfigC(
+        wl=cfg.wl.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_wl=n_wl,
+        aod=cfg.aod.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_aod=n_aod,
+        h2o=cfg.h2o.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_h2o=n_h2o,
+        sza=cfg.sza, vza=cfg.vza, raa=cfg.raa,
+        altitude_km=cfg.altitude_km,
+        atmo_model=cfg.atmo_model, aerosol_model=cfg.aerosol_model,
+        surface_pressure=cfg.surface_pressure, ozone_du=cfg.ozone_du,
+    )
+
+    Ra = np.ascontiguousarray(lut_arrays.R_atm.ravel(), dtype=np.float32)
+    Td = np.ascontiguousarray(lut_arrays.T_down.ravel(), dtype=np.float32)
+    Tu = np.ascontiguousarray(lut_arrays.T_up.ravel(),   dtype=np.float32)
+    sa = np.ascontiguousarray(lut_arrays.s_alb.ravel(),  dtype=np.float32)
+    c_arr = _LutArraysC(
+        R_atm  =Ra.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_down =Td.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_up   =Tu.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        s_alb  =sa.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        T_down_dir=None,
+    )
+
+    def _fptr(arr):
+        if arr is None: return None
+        a = np.ascontiguousarray(arr, dtype=np.float32)
+        return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), a
+
+    p865,  _k865  = _fptr(L_865)  if L_865  is not None else (None, None)
+    p940,  _k940  = _fptr(L_940)  if L_940  is not None else (None, None)
+    p1040, _k1040 = _fptr(L_1040) if L_1040 is not None else (None, None)
+
+    out_aod = np.empty(npix, dtype=np.float32)
+    out_h2o = np.empty(npix, dtype=np.float32)
+
+    _lib.oe_invert_aod_h2o(
+        ctypes.byref(c_cfg), ctypes.byref(c_arr),
+        rho_vis.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        npix, n_vis,
+        vis_wl_.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        p865, p940, p1040,
+        float(sza_deg), float(vza_deg),
+        float(aod_prior), float(h2o_prior),
+        float(sigma_aod), float(sigma_h2o), float(sigma_spec),
+        out_aod.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        out_h2o.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return out_aod, out_h2o

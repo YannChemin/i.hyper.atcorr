@@ -1,5 +1,9 @@
-/* Spatial filtering: separable Gaussian and box filters.
- * See include/spatial.h for API documentation. */
+/**
+ * \file spatial.c
+ * \brief Separable Gaussian and box filter implementation.
+ *
+ * \see include/spatial.h for the public API.
+ */
 
 #include "spatial.h"
 

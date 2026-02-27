@@ -50,4 +50,9 @@ install: $(ATCORR_SHLIB)
 	$(INSTALL) $(ATCORR_SHLIB) $(INST_DIR)/lib/
 	@echo "Installed $(PGM) and libatcorr$(SHLIB_SUFFIX)"
 
-.PHONY: cmd install
+# ── Programmer's manual (Doxygen) ──────────────────────────────────────────────
+doxygen:
+	doxygen Doxyfile
+	@echo "Programmer's manual: doc/html/index.html"
+
+.PHONY: cmd install doxygen

@@ -1,8 +1,10 @@
-/* BRDF surface models — ported from 6SV2.1 *BRDF.f subroutines.
+/**
+ * \file brdf.c
+ * \brief BRDF surface models — C port of 6SV2.1 BRDF Fortran subroutines.
  *
  * Each kernel function provides a single-point evaluation; the Fortran
- * originals loop over (mu, np) Gauss grids but the inner formula is
- * geometry-only, so we extract it for single (sza, vza, raa) calls.
+ * originals loop over (μ, φ) Gauss grids but the inner formula is
+ * geometry-only, so we extract it for single (SZA, VZA, RAA) calls.
  *
  * Models implemented (single-point):
  *   LAMBERTIAN    — constant (handled by caller; brdf_eval returns 0)
@@ -323,4 +325,106 @@ float sixs_brdf_albe(BrdfType type, const BrdfParams *params,
     }
     albe /= pi;   /* normalise by π for hemispherical reflectance */
     return albe;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ * NBAR normalisation — MODIS MCD43 standard Ross-Thick + Li-Sparse kernels
+ *
+ * These are the unmodified kernels from Lucht et al. (2000, IEEE TGRS 38:977).
+ * They differ from brdf_rosslimaignan() in that:
+ *   - Ross-Thick: no Maignan hot-spot factor
+ *   - Li-Sparse: b/r = 1 (no crown ellipsoid stretching), h/b = 2
+ *
+ * Input angles in degrees; uses cos/sin of those angles internally.
+ * Both kernels return 0 at nadir (vza=0), which is used for f_nbar.
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+/* Ross-Thick volumetric kernel (standard MODIS, no hot-spot).
+ * K_RT = [(π/2 − ξ)cos(ξ) + sin(ξ)] / (μs + μv) × (2/3π) − 1/3
+ * where ξ = arccos(μs μv + √(1−μs²)√(1−μv²) cos(Δφ)). */
+static float brdf_rossthick_std(float sza_deg, float vza_deg, float raa_deg)
+{
+    const float pi = (float)M_PI;
+
+    float rts = sza_deg * (pi / 180.0f);
+    float rtv = vza_deg * (pi / 180.0f);
+    float rfi = raa_deg * (pi / 180.0f);
+
+    float cts = cosf(rts), stv_s = sinf(rts);
+    float ctv = cosf(rtv), stv_v = sinf(rtv);
+
+    float cpha = clampf(cts*ctv + stv_s*stv_v*cosf(rfi), -1.0f, 1.0f);
+    float rpha = acosf(cpha);
+
+    float rosselt = (2.0f / (3.0f*pi))
+                  * (((pi/2.0f - rpha)*cpha + sinf(rpha)) / (cts + ctv + 1e-10f));
+    return rosselt - 1.0f/3.0f;
+}
+
+/* Li-Sparse geometric kernel (standard MODIS, b/r=1, h/b=2).
+ * Uses the reciprocal overlap area O and the secant terms. */
+static float brdf_lisparse_std(float sza_deg, float vza_deg, float raa_deg)
+{
+    const float pi = (float)M_PI;
+
+    float rts = sza_deg * (pi / 180.0f);
+    float rtv = vza_deg * (pi / 180.0f);
+    float rfi = raa_deg * (pi / 180.0f);
+
+    float cts  = cosf(rts), stv_s = sinf(rts);
+    float ctv  = cosf(rtv), stv_v = sinf(rtv);
+    float cfi  = cosf(rfi), sfi   = sinf(rfi);
+
+    /* Phase angle for the (1 + cos ξ) term */
+    float cpha = clampf(cts*ctv + stv_s*stv_v*cfi, -1.0f, 1.0f);
+
+    /* tan(θs), tan(θv)  [b/r = 1 so θs' = θs, θv' = θv] */
+    float tants = (cts > 1e-6f) ? stv_s / cts : stv_s / 1e-6f;
+    float tantv = (ctv > 1e-6f) ? stv_v / ctv : stv_v / 1e-6f;
+
+    float D2    = tants*tants + tantv*tantv - 2.0f*tants*tantv*cfi;
+    float D     = sqrtf(clampf(D2, 0.0f, 1e10f));
+
+    float sec_s  = (cts > 1e-6f) ? 1.0f / cts : 1.0f / 1e-6f;
+    float sec_v  = (ctv > 1e-6f) ? 1.0f / ctv : 1.0f / 1e-6f;
+    float sec_sum = sec_s + sec_v;
+
+    /* cos(t): h/b = 2 factor */
+    float cost = 2.0f * sqrtf(clampf(D2 + tants*tants*tantv*tantv*sfi*sfi,
+                                      0.0f, 1e10f))
+               / (sec_sum + 1e-10f);
+    cost = clampf(cost, -1.0f, 1.0f);
+    float t    = acosf(cost);
+    float sint = sqrtf(clampf(1.0f - cost*cost, 0.0f, 1.0f));
+
+    /* Overlap area O */
+    float O = (t - sint*cost) * sec_sum / pi;
+
+    return O - sec_sum + 0.5f*(1.0f + cpha) / (cts*ctv + 1e-10f);
+}
+
+/* ── Public: NBAR normalisation ─────────────────────────────────────────── */
+
+float atcorr_brdf_normalize(float rho_boa,
+                             float f_iso, float f_vol, float f_geo,
+                             float sza_obs, float vza_obs, float raa_obs,
+                             float sza_nbar)
+{
+    /* Short-circuit: Lambertian (no anisotropy) */
+    if (f_vol == 0.0f && f_geo == 0.0f)
+        return rho_boa;
+
+    float K_vol_obs  = brdf_rossthick_std(sza_obs,  vza_obs, raa_obs);
+    float K_geo_obs  = brdf_lisparse_std (sza_obs,  vza_obs, raa_obs);
+    float K_vol_nbar = brdf_rossthick_std(sza_nbar, 0.0f,    0.0f);
+    float K_geo_nbar = brdf_lisparse_std (sza_nbar, 0.0f,    0.0f);
+
+    float f_obs  = f_iso + f_vol * K_vol_obs  + f_geo * K_geo_obs;
+    float f_nbar = f_iso + f_vol * K_vol_nbar + f_geo * K_geo_nbar;
+
+    /* Protect against division by zero */
+    if (fabsf(f_obs) < 1e-6f)
+        return rho_boa;
+
+    return rho_boa * (f_nbar / f_obs);
 }

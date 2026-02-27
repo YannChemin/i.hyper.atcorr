@@ -283,6 +283,96 @@ reflectance factor (BRF) at the acquisition geometry.
 
 ---
 
+## POLARIZATION OPTIONS
+
+```
+-P
+```
+
+Enable **vector (Stokes I, Q, U) radiative transfer** via `sixs_ospol()` instead
+of the scalar `sixs_os()`.  When active, the module computes the full Stokes
+description of the atmospheric path radiance, which improves R_atm accuracy by
+1–5 % in the blue/UV bands where Rayleigh scattering is strongly polarised.
+
+### Physics
+
+The standard scalar path adds only the intensity component *I* of the multiply-
+scattered radiance.  Rayleigh scattering is inherently polarised: photons
+scattered at 90° are up to 100 % linearly polarised, and the coupling between
+Q/U Stokes components and *I* raises the apparent path reflectance R_atm by
+roughly 4–5 % at 400 nm, decreasing monotonically to < 0.5 % beyond 860 nm.
+Aerosol scattering (assumed spherical in this implementation) contributes a
+smaller correction because the phase matrix off-diagonal terms are near zero.
+
+### Output arrays
+
+When `-P` is set, `LutArrays` carries two additional arrays alongside R_atm:
+
+| Field | Description |
+|-------|-------------|
+| `R_atmQ` | Q Stokes component of path reflectance (same [n_aod × n_h2o × n_wl] layout as R_atm) |
+| `R_atmU` | U Stokes component of path reflectance |
+
+For the typical geometry of a nadir-viewing satellite over a continental scene
+(SZA 30°, VZA 5°, RAA 90°):
+
+| Band | R_atm (scalar) | R_atm (vector) | R_atmQ | R_atmU |
+|------|----------------|----------------|--------|--------|
+| 400 nm | 0.140 | 0.147 (+4.6 %) | +0.016 | −0.005 |
+| 450 nm | 0.093 | 0.097 (+3.8 %) | +0.011 | −0.003 |
+| 550 nm | 0.043 | 0.044 (+2.3 %) | +0.005 | −0.002 |
+| 660 nm | 0.020 | 0.020 (+1.3 %) | +0.002 | −0.001 |
+| 860 nm | 0.006 | 0.006 (+0.4 %) | +0.001 |  0.000 |
+
+### Surface polarisation models
+
+Two surface polarisation forward models are included (available in `libatcorr.so`):
+
+- **POLGLIT** (`src/polglit.c`) — Cox–Munk ocean glint polarisation; anisotropic
+  Gaussian wave-facet distribution with Fresnel reflection (m = 1.33);
+  wind-direction-dependent via `azw_deg`.
+- **POLNAD** (`src/polglit.c`) — Nadal–Breon vegetation/soil model; Fresnel
+  polarisation with N = 1.5; linear mix of vegetation (`pveg`) and soil
+  contributions.
+
+### C API
+
+```c
+/* Enable in LutConfig (zero by default) */
+cfg.enable_polar = 1;
+
+/* Pre-allocate Q/U arrays (same size as R_atm) */
+size_t lut_sz = n_aod * n_h2o * n_wl;
+float *R_atmQ = calloc(lut_sz, sizeof(float));
+float *R_atmU = calloc(lut_sz, sizeof(float));
+
+LutArrays lut = { R_atm, T_down, T_up, s_alb, NULL,
+                  R_atmQ, R_atmU };
+atcorr_compute_lut(&cfg, &lut);
+```
+
+### Performance
+
+`sixs_ospol()` propagates a 3×3 Müller matrix at each quadrature point, so
+vector RT is approximately **3× slower** than scalar RT.  For most operational
+use-cases the accuracy gain in the blue bands does not justify the cost; the
+flag is most useful for validation studies or blue-UV applications.
+
+### Implementation notes
+
+- `src/ospol.c` — port of 6SV2.1 `OSPOL.f`; successive-orders vector RT
+- `src/kernelpol.c` — port of 6SV2.1 `KERNELPOL.f`; generalised spherical
+  functions and Müller-matrix kernels
+- `src/polglit.c` — port of 6SV2.1 `POLGLIT.f` + `POLNAD.f`; surface
+  polarisation models
+- `src/interp.c:sixs_interp_polar()` — linear (not log-log) interpolation for
+  Q/U because those components can be negative
+- After modifying `include/sixs_ctx.h` always run `make clean && make` —
+  the Makefile has no automatic header-dependency tracking, and a stale
+  `SixsDisc` layout causes a segfault in `sixs_gauss`
+
+---
+
 ## IMAGE-BASED RETRIEVAL OPTIONS
 
 i.hyper.atcorr can estimate the atmospheric state parameters directly from
@@ -455,14 +545,19 @@ and climate zone described.
 
 **Image-based retrieval quick reference** — which flags to activate per scene:
 
-| Example | Flags | Rationale |
-|---------|-------|-----------|
+| Example | Flags / options | Rationale |
+|---------|-----------------|-----------|
 | 1. Saharan dust | `-z dem=` | No DDV (barren desert); dry uniform H₂O; O₃ and elevation matter |
 | 2. Amazon | `-z -w -a` | Dense forest = ideal DDV; ~4 g/cm² WVC gradient; low tropical O₃ |
 | 3. Paris winter | `-z -a` | Variable O₃ (polar vortex); farmland DDV; dry winter air |
 | 4. Mediterranean | `-w -a` | Land–sea H₂O gradient; coastal DDV; stable O₃ |
 | 5. Sweden winter | `-z` | Polar O₃ enhancement at SZA=78°; snow = no DDV; very dry |
 | 6. Yukon summer | `-z -w -a dem=` | All four: boreal DDV + tundra WVC gradient + variable O₃ + elevation |
+| 10. Alps terrain | `slope= aspect= sun_azimuth=` | N/S slopes differ 10× in direct irradiance; T_down split into direct/diffuse |
+| 11. Sahel NBAR | `brdf_fiso= brdf_fvol= brdf_fgeo=` + `view_zenith= view_azimuth=` | Wide-swath off-nadir sensor; NBAR removes cross-track BRF view-angle variation |
+| 12. O₂-A pressure | `-p quality=` | Mountainous scene; per-pixel pressure and pre-correction masking |
+| 13. MAIAC patch AOD | `-a maiac_patch=` | Dense vegetation; spatial patch regularization of DDV outliers |
+| 14. Joint OE | `-e -w oe_sigma_aod=` | Most accurate simultaneous AOD+H₂O inversion; supersedes -a and -w |
 
 ---
 
@@ -974,6 +1069,323 @@ requirements.
 
 ---
 
+### 10. Alpine terrain illumination correction (Swiss Alps)
+
+**Scene**: Engadin valley, Switzerland, October (DOY 285).  SZA = 55°, solar
+azimuth ≈ 165° (SSE).  Mixed conifer forest and alpine meadow with slopes up
+to 40°.  A south-facing 30° slope receives
+cos(25°)/cos(55°) ≈ 1.58× the reference irradiance while a north-facing 30°
+slope at cos(85°)/cos(55°) ≈ 0.15× is effectively in diffuse-only
+illumination — a 10× contrast that creates severe reflectance artefacts if
+uncorrected.
+
+```sh
+# Prepare slope and aspect from a DEM
+r.slope.aspect elevation=srtm_30m slope=alps_slope aspect=alps_aspect
+# aspect= is clockwise from North as output by r.slope.aspect -c
+
+# Single command: generate LUT + apply terrain illumination correction.
+# slope= and aspect= trigger T_down_dir (direct-beam transmittance) computation
+# inside atcorr_compute_lut; T_down_dir is not written to the .lut file
+# (i.hyper.smac does not need it) but is used in-memory for the correction.
+# -z retrieves scene O3 from 600 nm Chappuis depth (common at mid-latitude autumn).
+i.hyper.atcorr -z \
+    input=alps_radiance output=alps_refl \
+    lut=alps_terrain.lut \
+    sza=55 vza=8 raa=90 doy=285 \
+    atmosphere=midwin aerosol=continental \
+    aod=0.0,0.05,0.1,0.2,0.4 \
+    h2o=0.5,1.0,2.0,3.5 \
+    aod_val=0.08 h2o_val=1.5 \
+    slope=alps_slope aspect=alps_aspect \
+    sun_azimuth=165 \
+    view_zenith=alps_vza \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005
+```
+
+**Physics**: T_down is split into direct (T_down_dir) and diffuse
+(T_down − T_down_dir) components from the 6SV DISCOM output.  Per pixel:
+
+- _Illuminated_ (cos_i > 0):
+  `T_down_eff = T_down_dir × (cos_i / cos_sza) + (T_down − T_down_dir) × V_d`
+- _Shadowed_ (cos_i ≤ 0):
+  `T_down_eff = (T_down − T_down_dir) × V_d`  (diffuse skylight only)
+
+where `cos_i = cos(sza)cos(s) + sin(sza)sin(s)cos(saa − aspect)` and
+`V_d = (1 + cos(slope)) / 2` is the terrain skyview factor.
+
+`view_zenith=` supplies per-pixel VZA from the pushbroom geometry model.  When
+provided, T_up is rescaled by the Beer-Lambert path-length ratio
+T_up^(cos_vza_ref / cos_vza_pixel).  Omit to use the scalar `vza=` value for
+all pixels.
+
+**Notes**:
+
+- `slope=` and `aspect=` must always be provided together; omitting either
+  disables terrain correction.
+- The `.lut` file output (for i.hyper.smac) does not contain T_down_dir.
+  Combining `lut=` with `input=/output=/slope=/aspect=` in one command is
+  therefore the recommended workflow.
+- For an accurate `sun_azimuth=` value, use `r.sunmask`, the scene metadata
+  (`sun azimuth` field in ENVI HDR or HDF5 product), or `sixs_possol()` from
+  the C library API.
+
+---
+
+### 11. NBAR normalization from MCD43 kernel weights (West African savanna)
+
+**Scene**: Senegal/Mali Sahel, April (DOY 100).  SZA = 35°, wide-swath
+pushbroom sensor (e.g. DESIS: ±12°, PRISMA: ±12.7°, EMIT: ±39°,
+Tanager-1: ±7°) with per-pixel view zenith 0–25° across the swath.
+At VZA = 20° the forward-scatter bowl effect can suppress NIR reflectance
+by 5–15% relative to nadir view on bright soil; the backscatter hot-spot
+enhancement creates the opposite effect.  NBAR normalization removes the
+cross-track gradient for time-series compositing and mixed-scene analysis.
+
+```sh
+# Step 1: Download and resample MCD43A1 kernel weights.
+# Product: MCD43A1 Collection 6.1 (500 m, 8-day or daily from LP DAAC / LAADS).
+# Scale factor 0.001 (int16 → float32).  Here for tile h17v07, DOY 100.
+# Use the nearest MODIS band as a spectral proxy for each hyper-band range.
+
+r.import input=MCD43A1.A2024100.h17v07.061.Band1_f_iso.tif \
+    output=mcd43_fiso resolution=value resolution_value=30 resample=bilinear
+r.import input=MCD43A1.A2024100.h17v07.061.Band1_f_vol.tif \
+    output=mcd43_fvol resolution=value resolution_value=30 resample=bilinear
+r.import input=MCD43A1.A2024100.h17v07.061.Band1_f_geo.tif \
+    output=mcd43_fgeo resolution=value resolution_value=30 resample=bilinear
+
+# Step 2: Atmospheric correction + NBAR normalization.
+# view_zenith= and view_azimuth= come from the sensor L1 geometry model.
+# sun_azimuth= is a scalar from scene metadata (degrees CW from North).
+# -w -a retrieve per-pixel WVC and AOD from the image.
+i.hyper.atcorr -w -a \
+    input=senegal_radiance output=senegal_nbar \
+    lut=senegal.lut \
+    sza=35 doy=100 \
+    atmosphere=tropical aerosol=continental \
+    aod=0.0,0.05,0.1,0.2,0.5 \
+    h2o=1.0,2.0,3.5,5.0 \
+    aod_val=0.12 h2o_val=2.5 \
+    sun_azimuth=128 \
+    view_zenith=senegal_vza view_azimuth=senegal_vaa \
+    brdf_fiso=mcd43_fiso brdf_fvol=mcd43_fvol brdf_fgeo=mcd43_fgeo \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005
+```
+
+**MCD43 typical kernel weights by land cover** (Schaaf et al. 2002,
+*Remote Sensing of Environment* 83, 135–148):
+
+| Land cover | Band (µm) | f_iso | f_vol | f_geo | ρ_NBAR / ρ_obs at VZA=20°, RAA=90° |
+|---|---|---|---|---|---|
+| Savanna / grassland | Red 0.66 | 0.119 | 0.067 | 0.026 | 0.95–1.08 |
+| Savanna / grassland | NIR 0.86 | 0.220 | 0.116 | 0.033 | 0.93–1.06 |
+| Deciduous broadleaf | Red 0.66 | 0.093 | 0.080 | 0.019 | 0.97–1.10 |
+| Deciduous broadleaf | NIR 0.86 | 0.354 | 0.193 | 0.069 | 0.92–1.09 |
+| Cropland | Red 0.66 | 0.154 | 0.074 | 0.031 | 0.96–1.07 |
+| Cropland | NIR 0.86 | 0.265 | 0.119 | 0.054 | 0.94–1.06 |
+| Bare soil / desert | Red 0.66 | 0.200 | 0.020 | 0.052 | 0.91–1.12 |
+| Bare soil / desert | NIR 0.86 | 0.252 | 0.020 | 0.056 | 0.90–1.14 |
+
+**NBAR formula**: `ρ_NBAR = ρ_boa × f_nbar / f_obs` where
+`f = f_iso + f_vol × K_RT + f_geo × K_LS`.
+Standard MODIS Ross-Thick (K_RT) and Li-Sparse (K_LS) kernels are used
+(b/r = 1, h/b = 2); no Maignan hot-spot correction.
+K_LS = 0 at nadir, so `f_nbar = f_iso + f_vol × K_RT(sza, 0, 0)`.
+The correction is bypassed for pixels where f_obs < 10⁻⁶ (prevents
+division-by-zero) or when f_vol = f_geo = 0 (Lambertian → no anisotropy).
+
+**MCD43A1 source**: LP DAAC / LAADS DAAC,
+`https://lpdaac.usgs.gov/products/mcd43a1v061/`.
+Scale factor 0.001 for all kernel weight bands.  The product is available
+globally every 8 days (or daily in Collection 6.1).  Use the tile covering
+the scene; spatial resolution 500 m, resample to sensor pixel size with
+bilinear interpolation.
+
+---
+
+### 12. O₂-A per-pixel surface pressure + pre-correction quality mask
+
+**Scene**: Landsat-resolution hyperspectral over the Rocky Mountains
+(Colorado, USA; DOY 200, SZA=30°).  Elevation ranges 1500–4400 m (pressure
+700–860 hPa), causing a 10–15% band-to-band Rayleigh error if ignored.
+Mixed land cover with glaciers (NDSI test) and alpine lakes (water test).
+
+```sh
+# Step 1: generate LUT with standard sea-level reference
+i.hyper.atcorr \
+    lut=rockies.lut \
+    input=rockies_radiance \
+    output=rockies_refl \
+    sza=30 vza=4 raa=120 doy=200 \
+    atmosphere=us62 aerosol=continental \
+    aod=0.02,0.05,0.1,0.2,0.4 \
+    h2o=0.5,1.0,2.0,3.5 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005 \
+    -p -m -w \
+    quality=rockies_quality
+
+# The -p flag retrieves per-pixel surface pressure from the O₂-A band at 760 nm
+# and applies per-pixel Rayleigh scaling: R_atm, T_down, T_up are adjusted
+# according to  τ_R(λ, P) = 0.00877 × λ^(−4.05) × P/P₀  (Hansen & Travis 1974)
+#
+# The -m flag outputs a bitmask raster (integer, bits: 0=cloud 1=shadow 2=water 3=snow)
+# which can be used to mask the output or exclude pixels from further analysis:
+r.mapcalc "rockies_refl_masked = if(rockies_quality == 0, rockies_refl_band60, null())"
+```
+
+**Physics of the pressure correction**:
+
+- Rayleigh optical depth scales linearly with surface pressure:
+  τ_R(λ, P) = 0.00877 × λ^(−4.05) × P/P₀
+- At 450 nm (blue), Δτ_R ≈ 0.08 for ΔP = 300 hPa → ΔT ≈ 8% → 5% BOA error if ignored
+- At 700 nm (red), Δτ_R ≈ 0.01 → effect is negligible (<1%)
+- The correction is applied in-band per pixel before inversion
+
+**O₂-A K_O2 tuning**: the default K_O2 = 0.25 is calibrated for ~10 nm FWHM.
+For sensors with different bandwidths: PRISMA/5 nm ≈ 0.40; AVIRIS-NG/4 nm ≈ 0.45;
+DESIS/2.5 nm ≈ 0.55.  Tune by comparing retrieved scene-mean pressure against
+co-located DEM-based ISA pressure.
+
+---
+
+### 13. MAIAC patch AOD spatial regularization (dense vegetation)
+
+**Scene**: Tanager over a mixed agricultural/forest scene in Central Europe
+(DOY 160, SZA=35°).  DDV retrieval yields spatially noisy per-pixel AOD because
+individual DDV pixels in heterogeneous fields produce single-pixel outliers.
+
+```sh
+i.hyper.atcorr \
+    input=central_europe_radiance \
+    output=central_europe_refl \
+    sza=35 vza=3 raa=100 doy=160 \
+    atmosphere=us62 aerosol=continental \
+    aod=0.02,0.05,0.1,0.2,0.4 \
+    h2o=0.5,1.0,2.0,3.5 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005 \
+    -a -w \
+    maiac_patch=32
+
+# The -a flag retrieves per-pixel DDV AOD (scene mean ~0.12 for this clean scene).
+# maiac_patch=32 applies the MAIAC-inspired patch regularization:
+#   1. Image divided into non-overlapping 32×32 pixel patches
+#   2. Each patch AOD → patch median (robust to DDV outliers)
+#   3. Patches with no DDV pixels filled by inverse-distance weighting
+#      from valid patch centroids (IDW)
+#   4. Pixel-level AOD replaced by its patch median value
+#
+# Effect: eliminates single-pixel hot-spots from isolated DDV pixels;
+# provides spatially coherent AOD field comparable to MAIAC 1 km product
+# at the native sensor resolution.
+```
+
+**Patch size guidelines**:
+
+| Sensor GSD | Scene size | Recommended patch_sz |
+|------------|-----------|---------------------|
+| 30 m | 30 km | 32 px (~1 km²) |
+| 5 m  | 5 km  | 16 px (~80 m²) |
+| 1 m  | 1 km  | 8 px  (~8 m²) |
+
+Smaller patches preserve more spatial variability but require denser DDV coverage.
+Larger patches smooth more aggressively.
+
+---
+
+### 14. Joint optimal-estimation AOD + H₂O retrieval (-e)
+
+**Scene**: PRISMA over a semi-arid shrubland in southern Spain (DOY 120,
+SZA=25°).  Mixed surfaces (sparse vegetation + bare soil) mean that the DDV
+assumption is invalid for most pixels.  The spectral-smoothness OE retrieves
+both AOD and H₂O simultaneously without requiring DDV targets.
+
+```sh
+i.hyper.atcorr \
+    input=spain_radiance \
+    output=spain_refl \
+    sza=25 vza=2 raa=80 doy=120 \
+    atmosphere=midsum aerosol=continental \
+    aod=0.02,0.05,0.1,0.2,0.4 \
+    h2o=0.5,1.0,2.0,3.5 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005 \
+    aod_val=0.1 h2o_val=1.5 \
+    -e \
+    oe_sigma_aod=0.5 oe_sigma_h2o=1.0
+
+# -e: joint optimal estimation retrieval
+#   VIS diagnostic bands: 470, 550, 660, 870 nm (aerosol sensitivity)
+#   NIR constraint:       865, 940, 1040 nm (H₂O absorption)
+#
+# Cost function per pixel:
+#   J_spec  = ||ρ_boa(b) − linear_fit(ρ_boa)||² / σ_spec²
+#             (spectral smoothness; over/under-corrected spectra show
+#              a step at 470 nm that penalises wrong AOD)
+#   J_h2o   = (D_940_meas − K_940 × m × H₂O)² / σ_D²
+#   J_prior = (ln AOD − ln AOD_prior)² / σ_a²
+#           + (H₂O − H₂O_prior)²       / σ_h²
+#
+# Grid search over LUT (AOD_i, H₂O_j) points + parabolic sub-grid refinement.
+# oe_sigma_aod=0.5: broad prior (±50% in log-AOD space)
+# oe_sigma_h2o=1.0: broad prior (±1 g/cm²)
+# Output: same as normal correction but uses per-pixel AOD/H₂O from OE
+```
+
+**Notes**:
+
+- OE supersedes independent `-a` (DDV) and `-w` (940 nm) when used together with `-e`
+- OE requires the LUT to be already computed → runs after `atcorr_compute_lut`
+- The spectral smoothness cost is scale-independent (relative to a linear fit)
+  and works for any surface type (vegetation, soil, water, urban)
+- For scenes with many cloud/snow pixels, combine with `-m quality=` and post-mask
+- OE is single-pass (no outer iteration between surface and atmosphere) — for
+  highest accuracy over bright surfaces, iterate manually: correct → extract
+  per-pixel surface spectra → rerun OE using surface prior from first pass
+
+**Sigma tuning**:
+
+| Scenario | oe_sigma_aod | oe_sigma_h2o |
+|----------|-------------|-------------|
+| Strong prior from DEM/MODIS | 0.2 | 0.5 |
+| Weak prior (tropical) | 0.8 | 2.0 |
+| Default (midlatitude) | 0.5 | 1.0 |
+
+---
+
+## Fortran 6SV2.1 compatibility
+
+`testsuite/test_fortran_compat.py` (25 tests) cross-checks every C function
+in `libatcorr.so` against the original Fortran 77 subroutines compiled from
+`~/dev/6SV2.1/`.  All 25 tests pass; no C code bugs were found.
+
+| Subroutine | C function | Tests | Tolerance | Actual agreement |
+|---|---|---|---|---|
+| CHAND | `sixs_chand()` | 4 geometries | rtol=1×10⁻⁵ | ~7×10⁻⁸ (float32 limit) |
+| ODRAYL | `sixs_odrayl()` | 4 wavelengths | rtol=5×10⁻³ | ~2×10⁻⁷ |
+| VARSOL × d² ≈ 1 | `sixs_earth_sun_dist2()` | 4 DOYs | rtol=5×10⁻³ | <0.07% |
+| SOLIRR / E0 on-grid | `sixs_E0()` | 4 wavelengths | rtol=1×10⁻³ | 0–3 ULP |
+| SOLIRR / E0 off-grid | `sixs_E0()` | 1 wavelength (0.5512 µm) | rtol=1×10⁻³ | 0.035% |
+| CSALBR | `sixs_csalbr()` | 3 τ values | rtol=1×10⁻⁵ | ~9×10⁻⁸ (float32 limit) |
+| GAUSS | `sixs_gauss()` | n=4 + n=8, weight sums, symmetry | rtol=1×10⁻⁵ | Exact float32 |
+
+Minor intentional differences:
+
+- `sixs_E0()` uses linear interpolation for off-grid wavelengths; Fortran SOLIRR
+  uses nearest-neighbour — both agree to 0.035% on the smooth solar spectrum.
+- `sixs_earth_sun_dist2()` returns d² (< 1 at perihelion); Fortran VARSOL returns
+  1/d² (> 1) — the product ≈ 1.0 within 0.07%, confirming complementary conventions.
+- Solar table float32 literals produce 0–3 ULP differences between gfortran and
+  the C compiler — not a bug.
+
+To run the tests (requires `~/dev/6SV2.1/` with 6SV2.1 source):
+
+```sh
+cd ~/dev/6sV2.1
+gfortran -O -ffixed-line-length-132 -c CHAND.f ODRAYL.f VARSOL.f SOLIRR.f CSALBR.f GAUSS.f US62.f
+cd ~/dev/i.hyper.atcorr
+grass --tmp-project XY --exec python3 testsuite/test_fortran_compat.py
+```
+
 ## SEE ALSO
 
 *[i.hyper.smac](i.hyper.smac.md), [i.atcorr](i.atcorr.md)*
@@ -997,6 +1409,16 @@ requirements.
   over land surfaces: Background, operational algorithm and validation.
   *Journal of Geophysical Research: Atmospheres*, 102(D14),
   17131–17141. (adjacency correction)
+- Schaaf, C.B. et al. (2002): First operational BRDF, albedo nadir
+  reflectance products from MODIS. *Remote Sensing of Environment*,
+  83(1–2), 135–148. (MCD43 kernel weights)
+- Roujean, J.L., Leroy, M. and Deschamps, P.Y. (1992): A bidirectional
+  reflectance model of the Earth's surface for the correction of remote
+  sensing data. *Journal of Geophysical Research: Atmospheres*, 97(D18),
+  20455–20468. (Ross-Thick + Li-Sparse kernels)
+- Teillet, P.M., Guindon, B. and Goodenough, D.G. (1982): On the slope-
+  aspect correction of multispectral scanner data. *Canadian Journal of
+  Remote Sensing*, 8(2), 84–106. (terrain illumination cosine correction)
 
 ## AUTHORS
 
