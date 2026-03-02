@@ -1,0 +1,48 @@
+var hierarchy =
+[
+    [ "BrdfParams", "unionBrdfParams.html", null ],
+    [ "GasSpectrum", "structGasSpectrum.html", null ],
+    [ "IsoFitParams", "structIsoFitParams.html", null ],
+    [ "atcorr.LutArrays", "classatcorr_1_1LutArrays.html", null ],
+    [ "LutArrays", "structLutArrays.html", null ],
+    [ "atcorr.LutConfig", "classatcorr_1_1LutConfig.html", null ],
+    [ "LutConfig", "structLutConfig.html", null ],
+    [ "SixsAer", "structSixsAer.html", null ],
+    [ "SixsAerProf", "structSixsAerProf.html", null ],
+    [ "SixsAtm", "structSixsAtm.html", null ],
+    [ "SixsCtx", "structSixsCtx.html", null ],
+    [ "SixsDel", "structSixsDel.html", null ],
+    [ "SixsDisc", "structSixsDisc.html", null ],
+    [ "SixsErr", "structSixsErr.html", null ],
+    [ "SixsMultiOrder", "structSixsMultiOrder.html", null ],
+    [ "SixsPolar", "structSixsPolar.html", null ],
+    [ "SixsQuad", "structSixsQuad.html", null ],
+    [ "SrfConfig", "structSrfConfig.html", null ],
+    [ "SrfCorrection_", "structSrfCorrection__.html", null ],
+    [ "ctypes.Structure", null, [
+      [ "atcorr._LutArraysC", "classatcorr_1_1__LutArraysC.html", null ],
+      [ "atcorr._LutConfigC", "classatcorr_1_1__LutConfigC.html", null ],
+      [ "atcorr._SrfConfigC", "classatcorr_1_1__SrfConfigC.html", null ]
+    ] ],
+    [ "SurfaceModelImpl_", "structSurfaceModelImpl__.html", null ],
+    [ "TestCase", null, [
+      [ "test_grass_module.TestIHyperAtcorrCorrect", "classtest__grass__module_1_1TestIHyperAtcorrCorrect.html", null ],
+      [ "test_grass_module.TestIHyperAtcorrLUT", "classtest__grass__module_1_1TestIHyperAtcorrLUT.html", null ],
+      [ "test_lut.TestInversion", "classtest__lut_1_1TestInversion.html", null ],
+      [ "test_lut.TestLutAerosolModels", "classtest__lut_1_1TestLutAerosolModels.html", null ],
+      [ "test_lut.TestLutMonotonicity", "classtest__lut_1_1TestLutMonotonicity.html", null ],
+      [ "test_lut.TestLutPhysicalBounds", "classtest__lut_1_1TestLutPhysicalBounds.html", null ],
+      [ "test_lut.TestLutShape", "classtest__lut_1_1TestLutShape.html", null ],
+      [ "test_lut.TestLutSlice", "classtest__lut_1_1TestLutSlice.html", null ],
+      [ "test_lut.TestPolarization", "classtest__lut_1_1TestPolarization.html", null ],
+      [ "test_retrievals.TestAODDDV", "classtest__retrievals_1_1TestAODDDV.html", null ],
+      [ "test_retrievals.TestAODMaiac", "classtest__retrievals_1_1TestAODMaiac.html", null ],
+      [ "test_retrievals.TestH2O940", "classtest__retrievals_1_1TestH2O940.html", null ],
+      [ "test_retrievals.TestO3Chappuis", "classtest__retrievals_1_1TestO3Chappuis.html", null ],
+      [ "test_retrievals.TestPressureISA", "classtest__retrievals_1_1TestPressureISA.html", null ],
+      [ "test_retrievals.TestPressureO2A", "classtest__retrievals_1_1TestPressureO2A.html", null ],
+      [ "test_retrievals.TestQualityMask", "classtest__retrievals_1_1TestQualityMask.html", null ],
+      [ "test_solar.TestEarthSunDist", "classtest__solar_1_1TestEarthSunDist.html", null ],
+      [ "test_solar.TestSolarSpectrum", "classtest__solar_1_1TestSolarSpectrum.html", null ]
+    ] ]
+];

@@ -1,0 +1,142 @@
+/**
+ * \mainpage i.hyper.atcorr — Hyperspectral Atmospheric Correction
+ *
+ * \section intro_sec Overview
+ *
+ * **i.hyper.atcorr** is a GRASS GIS add-on module and C library for
+ * physics-based atmospheric correction of hyperspectral remote sensing data.
+ * It is built on a C port of the 6SV2.1 (Second Simulation of the Satellite
+ * Signal in the Solar Spectrum, Vector, version 2.1) radiative-transfer engine,
+ * extended with ISOFIT-inspired retrieval algorithms, terrain/BRDF corrections,
+ * and a Python ctypes interface.
+ *
+ * \section arch_sec Architecture
+ *
+ * The library is organised in four tiers:
+ *
+ * \subsection tier1 Tier 1 — 6SV2.1 Core (C port)
+ * Ports of the original Fortran successive-orders RT subroutines:
+ * - `src/rt.c`, `src/discom.c` — scalar successive-orders RT (sixs_os())
+ * - `src/ospol.c`, `src/kernelpol.c` — vector Stokes (I,Q,U) RT (sixs_ospol())
+ * - `src/trunca.c`, `src/scatra.c`, `src/kernel.c` — phase function and
+ *   quadrature setup
+ * - `src/aerosol.c`, `src/mie.c` — aerosol optical properties
+ * - `src/rayleigh.c`, `src/chand.c` — Rayleigh scattering
+ * - `src/gas_abs.c`, `src/gas_tables.c` — gas transmittance (reptran method)
+ * - `src/solar_table.c`, `src/solar.c` — Thuillier solar spectrum
+ *
+ * \subsection tier2 Tier 2 — LUT Engine
+ * - `src/lut.c` — builds the 3-D LUT [AOD × H₂O × λ] by calling DISCOM over
+ *   an OpenMP-parallel AOD grid; interpolates spectral results from 20 discrete
+ *   reference wavelengths to any target wavelength
+ * - `src/atcorr.c` — `atcorr_lut_slice()`, `atcorr_lut_interp_pixel()`
+ * - `src/interp.c` — log–log and linear spectral interpolation helpers
+ *
+ * \subsection tier3 Tier 3 — Physical Corrections
+ * - `src/terrain.c`      — local illumination angle, skyview factor, T_down/T_up
+ *                          rescaling for tilted terrain (Proy 1989, Richter 1997)
+ * - `src/brdf.c`         — BRDF models (RPV, Roujean, Hapke, Ocean, Walthall,
+ *                          Minnaert, Ross-Li/Maignan); NBAR normalisation (MCD43)
+ * - `src/adjacency.c`    — Vermote 1997 adjacency effect correction
+ * - `src/spatial.c`      — Gaussian and box filters for AOD/H₂O smoothing
+ * - `src/srf_conv.c`     — SRF-convolved gas transmittance via libRadtran reptran
+ * - `src/polglit.c`      — surface polarisation: POLGLIT (ocean) and POLNAD
+ *                          (vegetation/soil)
+ *
+ * \subsection tier4 Tier 4 — Retrieval and Inversion
+ * - `src/retrieve.c`     — scene-mean and per-pixel retrieval: H₂O (940 nm band
+ *                          depth), AOD (MODIS DDV), O₃ (Chappuis), pressure (ISA
+ *                          and O₂-A), cloud/shadow/water/snow quality mask
+ * - `src/oe_invert.c`    — joint per-pixel AOD + H₂O MAP inversion (grid-search
+ *                          optimal estimation with spectral smoothness prior)
+ * - `src/surface_model.c` — 3-component surface prior (vegetation, soil, water)
+ *                           and diagonal MAP regularisation
+ * - `src/uncertainty.c`  — NEDL-based noise + AOD perturbation uncertainty
+ *
+ * \section api_sec Public C API
+ *
+ * The public API is declared in the headers under `include/`:
+ *
+ * | Header               | Contents |
+ * |----------------------|---------|
+ * | `include/atcorr.h`   | LutConfig, LutArrays, atcorr_compute_lut(), inversion, solar |
+ * | `include/brdf.h`     | BrdfType, BrdfParams, sixs_brdf_eval(), NBAR normalisation |
+ * | `include/retrieve.h` | H₂O, AOD, O₃, pressure, quality mask retrievals |
+ * | `include/terrain.h`  | cos_incidence(), skyview_factor(), T_down/T_up correction |
+ * | `include/spatial.h`  | Gaussian and box filters |
+ * | `include/adjacency.h`| adjacency_correct_band() |
+ * | `include/surface_model.h` | SurfaceModelImpl, MAP regularisation |
+ * | `include/uncertainty.h`   | uncertainty_compute_band() |
+ * | `include/oe_invert.h`     | oe_invert_aod_h2o() |
+ *
+ * \section python_sec Python Bindings
+ *
+ * `python/atcorr.py` exposes the full public API via `ctypes`.  Load
+ * `libatcorr.so` (built with `make`) and call:
+ *
+ * \code{.py}
+ * import numpy as np
+ * from atcorr import LutConfig, compute_lut, lut_slice, invert
+ *
+ * cfg = LutConfig(
+ *     wl  = np.array([0.45, 0.55, 0.65, 0.87], dtype=np.float32),
+ *     aod = np.array([0.0, 0.2, 0.6],           dtype=np.float32),
+ *     h2o = np.array([1.0, 3.0],                dtype=np.float32),
+ *     sza=35.0, vza=5.0, raa=90.0, altitude_km=1000.0,
+ *     atmo_model=1, aerosol_model=1,
+ * )
+ * lut = compute_lut(cfg)               # shape [n_aod, n_h2o, n_wl]
+ * sl  = lut_slice(cfg, lut, 0.15, 2.0) # interpolate to (AOD=0.15, H2O=2.0)
+ * rho = invert(rho_toa, sl.R_atm, sl.T_down, sl.T_up, sl.s_alb)
+ * \endcode
+ *
+ * \section build_sec Building
+ *
+ * \code{.sh}
+ * # From the i.hyper.atcorr source directory:
+ * MODULE_TOPDIR=$HOME/dev/grass make
+ *
+ * # Outputs:
+ * #   dist.x86_64-pc-linux-gnu/bin/i.hyper.atcorr    (GRASS module)
+ * #   dist.x86_64-pc-linux-gnu/lib/libatcorr.so      (shared library)
+ *
+ * # Install to system GRASS (GRASS 8.6):
+ * sudo cp dist.*/bin/i.hyper.atcorr /usr/local/grass86/bin/
+ * sudo cp dist.*/lib/libatcorr.so   /usr/local/grass86/lib/
+ * \endcode
+ *
+ * \note After modifying `include/sixs_ctx.h` always rebuild with
+ *       `make clean && make` — the Makefile has no automatic header-dependency
+ *       tracking.  A stale `SixsDisc` layout causes a segfault inside
+ *       `sixs_gauss`.
+ *
+ * \section test_sec Unit Tests
+ *
+ * Tests follow GRASS GIS gunittest conventions and live in `testsuite/`.
+ * Run inside an active GRASS session:
+ *
+ * \code{.sh}
+ * cd testsuite && python -m grass.gunittest.main
+ * \endcode
+ *
+ * | Test file                       | Coverage |
+ * |---------------------------------|---------|
+ * | `testsuite/test_solar.py`       | Solar spectrum, Earth-Sun distance |
+ * | `testsuite/test_lut.py`         | LUT computation, inversion, polarization |
+ * | `testsuite/test_retrievals.py`  | H₂O, O₃, AOD, pressure, quality mask |
+ * | `testsuite/test_grass_module.py`| Full GRASS module, Raster3D I/O |
+ *
+ * \section refs_sec References
+ *
+ * - Vermote, E.F. et al. (1997). Second simulation of the satellite signal in
+ *   the solar spectrum (6S). *IEEE Trans. Geosci. Remote Sens.* 35:675–686.
+ * - Kaufman, Y.J. & Gao, B.C. (1992). Remote sensing of water vapour in the
+ *   near-IR from EOS/MODIS. *IEEE TGRS* 30:871–884.
+ * - Thompson, D.R. et al. (2019). Optimal estimation for imaging spectrometer
+ *   atmospheric correction (ISOFIT). *RSE* 224:260–271.
+ * - Rodgers, C.D. (2000). *Inverse Methods for Atmospheric Sounding*.
+ *   World Scientific.
+ *
+ * \author Yann
+ * \date 2025–2026
+ */
