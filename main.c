@@ -170,6 +170,36 @@ static int parse_band_wl(const char *mapname, float *wl, float *fwhm, int max_n)
     return n;
 }
 
+/* ── Append band wavelength metadata to Raster3D hist file ─────────────────── */
+
+static void write_band_wl_hist(const char *mapname,
+                                const float *wl, const float *fwhm, int n)
+{
+    const char *gisdbase = G_gisdbase();
+    const char *location = G_location();
+    const char *mapset   = G_mapset();
+    char histpath[GPATH_MAX];
+    snprintf(histpath, sizeof(histpath), "%s/%s/%s/grid3/%s/hist",
+             gisdbase, location, mapset, mapname);
+    FILE *f = fopen(histpath, "a");
+    if (!f) {
+        G_warning(_("Cannot append wavelength metadata to history of <%s>"), mapname);
+        return;
+    }
+    fprintf(f, "\nHyperspectral Metadata:\n");
+    fprintf(f, "Valid Bands: %d\n", n);
+    for (int i = 0; i < n; i++) {
+        if (wl[i] > 0.0f) {
+            float wl_nm = wl[i] * 1000.0f;
+            if (fwhm && fwhm[i] > 0.0f)
+                fprintf(f, "Band %d: %g nm, FWHM: %g nm\n", i + 1, wl_nm, fwhm[i] * 1000.0f);
+            else
+                fprintf(f, "Band %d: %g nm\n", i + 1, wl_nm);
+        }
+    }
+    fclose(f);
+}
+
 /* ── 1-D linear interpolation ───────────────────────────────────────────────── */
 
 static float interp_wl(const float *arr, const float *lut_wl, int n, float wl_um)
@@ -798,6 +828,11 @@ static void correct_raster3d(const char *input_name, const char *output_name,
         G_fatal_error(_("Cannot close output map <%s>"), output_name);
     if (uncmap && !Rast3d_close(uncmap))
         G_fatal_error(_("Cannot close uncertainty map <%s>"), iso->unc_output);
+
+    /* ── Propagate band wavelength metadata to output hist ── */
+    write_band_wl_hist(output_name, band_wl, band_fwhm, ndepths);
+    if (iso->unc_output)
+        write_band_wl_hist(iso->unc_output, band_wl, band_fwhm, ndepths);
 
     /* ── Cleanup ── */
     G_free(band_wl);    G_free(band_fwhm);
