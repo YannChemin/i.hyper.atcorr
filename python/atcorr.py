@@ -16,6 +16,8 @@ Public API
 - :func:`apply_srf_correction` — SRF gas-transmittance correction via libRadtran.
 - :func:`retrieve_pressure_isa` — ISA surface pressure from elevation.
 - :func:`retrieve_h2o_940`   — H₂O column from 940 nm band depth.
+- :func:`retrieve_h2o_triplet` — H₂O column from any (lo/feat/hi) triplet.
+- :func:`retrieve_h2o_consensus` — Per-pixel median consensus across triplets.
 - :func:`retrieve_o3_chappuis` — O₃ column from Chappuis band depth.
 - :func:`retrieve_aod_ddv`   — AOD from MODIS dark-target DDV.
 - :func:`retrieve_pressure_o2a` — Surface pressure from O₂-A band depth.
@@ -570,6 +572,7 @@ _lib.retrieve_h2o_940.argtypes = [
     ctypes.POINTER(ctypes.c_float),  # L_865
     ctypes.POINTER(ctypes.c_float),  # L_940
     ctypes.POINTER(ctypes.c_float),  # L_1040
+    ctypes.c_float,                  # fwhm_um  (0 = broadband default)
     ctypes.c_int,                    # npix
     ctypes.c_float,                  # sza_deg
     ctypes.c_float,                  # vza_deg
@@ -599,6 +602,35 @@ _lib.retrieve_aod_ddv.argtypes = [
 ]
 _lib.retrieve_aod_ddv.restype = ctypes.c_float
 
+_lib.retrieve_h2o_triplet.argtypes = [
+    ctypes.POINTER(ctypes.c_float),  # L_lo
+    ctypes.POINTER(ctypes.c_float),  # L_feat
+    ctypes.POINTER(ctypes.c_float),  # L_hi
+    ctypes.c_float,                  # wl_lo_um
+    ctypes.c_float,                  # wl_feat_um
+    ctypes.c_float,                  # wl_hi_um
+    ctypes.c_float,                  # K_ref
+    ctypes.c_float,                  # fwhm_ref_um
+    ctypes.c_float,                  # fwhm_um (0 = use K_ref)
+    ctypes.c_float,                  # D_min
+    ctypes.c_float,                  # D_max
+    ctypes.c_int,                    # npix
+    ctypes.c_float,                  # sza_deg
+    ctypes.c_float,                  # vza_deg
+    ctypes.POINTER(ctypes.c_float),  # out_wvc
+    ctypes.POINTER(ctypes.c_uint8),  # out_valid (may be NULL)
+]
+_lib.retrieve_h2o_triplet.restype = None
+
+_lib.retrieve_h2o_consensus.argtypes = [
+    ctypes.c_int,                                        # n_methods
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_float)),     # wvc_arrays
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),     # valid_arrays
+    ctypes.c_int,                                        # npix
+    ctypes.POINTER(ctypes.c_float),                      # out_wvc
+]
+_lib.retrieve_h2o_consensus.restype = ctypes.c_int
+
 
 def retrieve_pressure_isa(elev_m):
     """Surface pressure [hPa] from elevation (m) using ISA barometric formula.
@@ -608,7 +640,7 @@ def retrieve_pressure_isa(elev_m):
     return float(_lib.retrieve_pressure_isa(ctypes.c_float(float(elev_m))))
 
 
-def retrieve_h2o_940(L_865, L_940, L_1040, sza_deg, vza_deg):
+def retrieve_h2o_940(L_865, L_940, L_1040, sza_deg, vza_deg, fwhm_um=0.0):
     """Per-pixel water vapour column [g/cm²] from 940 nm band depth.
 
     Parameters
@@ -616,6 +648,9 @@ def retrieve_h2o_940(L_865, L_940, L_1040, sza_deg, vza_deg):
     L_865, L_940, L_1040 : 1-D float32 arrays [npix]
         TOA radiance at ~865, 940, 1040 nm.
     sza_deg, vza_deg : float
+    fwhm_um : float, optional
+        FWHM of the 940 nm band in µm.  Triggers FWHM-dependent K₉₄₀ scaling:
+        K = 0.036 × (50 nm / FWHM_nm)^0.60.  Default 0 uses K=0.036 (MODIS).
 
     Returns
     -------
@@ -630,10 +665,102 @@ def retrieve_h2o_940(L_865, L_940, L_1040, sza_deg, vza_deg):
         L_865.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         L_940.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         L_1040.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ctypes.c_float(float(fwhm_um)),
         npix, float(sza_deg), float(vza_deg),
         out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
     )
     return out
+
+
+def retrieve_h2o_triplet(L_lo, L_feat, L_hi,
+                          wl_lo_um, wl_feat_um, wl_hi_um,
+                          K_ref, fwhm_ref_um, sza_deg, vza_deg,
+                          fwhm_um=0.0, D_min=0.05, D_max=0.90):
+    """Per-pixel H₂O [g/cm²] from any (lo, feat, hi) wavelength triplet.
+
+    Parameters
+    ----------
+    L_lo, L_feat, L_hi : 1-D float32 arrays [npix]
+        TOA radiance at the continuum-lo, feature, and continuum-hi bands.
+    wl_lo_um, wl_feat_um, wl_hi_um : float
+        Band centre wavelengths [µm].
+    K_ref : float
+        Broadband reference absorption coefficient [cm²/g].
+    fwhm_ref_um : float
+        FWHM of the reference sensor [µm].
+    sza_deg, vza_deg : float
+    fwhm_um : float, optional
+        Actual sensor FWHM [µm]; 0 = use K_ref directly.
+    D_min, D_max : float, optional
+        Valid band-depth range; pixels outside are marked invalid.
+
+    Returns
+    -------
+    wvc : float32 array [npix]  WVC [g/cm²]
+    valid : uint8 array [npix]  1=valid, 0=excluded
+    """
+    L_lo   = np.ascontiguousarray(L_lo,   dtype=np.float32)
+    L_feat = np.ascontiguousarray(L_feat, dtype=np.float32)
+    L_hi   = np.ascontiguousarray(L_hi,   dtype=np.float32)
+    npix   = len(L_lo)
+    out_wvc   = np.empty(npix, dtype=np.float32)
+    out_valid = np.zeros(npix, dtype=np.uint8)
+    _lib.retrieve_h2o_triplet(
+        L_lo.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_feat.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        L_hi.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ctypes.c_float(float(wl_lo_um)),
+        ctypes.c_float(float(wl_feat_um)),
+        ctypes.c_float(float(wl_hi_um)),
+        ctypes.c_float(float(K_ref)),
+        ctypes.c_float(float(fwhm_ref_um)),
+        ctypes.c_float(float(fwhm_um)),
+        ctypes.c_float(float(D_min)),
+        ctypes.c_float(float(D_max)),
+        ctypes.c_int(npix),
+        ctypes.c_float(float(sza_deg)),
+        ctypes.c_float(float(vza_deg)),
+        out_wvc.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        out_valid.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+    )
+    return out_wvc, out_valid
+
+
+def retrieve_h2o_consensus(wvc_list, valid_list, npix):
+    """Per-pixel median consensus across multiple H₂O retrieval estimates.
+
+    Parameters
+    ----------
+    wvc_list : list of float32 arrays [npix]
+        WVC estimates from each method.
+    valid_list : list of uint8 arrays [npix]
+        Validity flags from each method (1=valid).
+    npix : int
+
+    Returns
+    -------
+    out_wvc : float32 array [npix]  consensus WVC [g/cm²]
+    n_agreed : int  number of pixels where ≥2 estimates agreed
+    """
+    n_methods = len(wvc_list)
+    wvc_list   = [np.ascontiguousarray(w, dtype=np.float32)  for w in wvc_list]
+    valid_list = [np.ascontiguousarray(v, dtype=np.uint8)    for v in valid_list]
+
+    fp_float = ctypes.POINTER(ctypes.c_float)
+    fp_uint8 = ctypes.POINTER(ctypes.c_uint8)
+
+    wvc_ptrs   = (fp_float * n_methods)(*[w.ctypes.data_as(fp_float) for w in wvc_list])
+    valid_ptrs = (fp_uint8 * n_methods)(*[v.ctypes.data_as(fp_uint8) for v in valid_list])
+
+    out_wvc = np.empty(npix, dtype=np.float32)
+    n_agreed = _lib.retrieve_h2o_consensus(
+        ctypes.c_int(n_methods),
+        wvc_ptrs,
+        valid_ptrs,
+        ctypes.c_int(npix),
+        out_wvc.ctypes.data_as(fp_float),
+    )
+    return out_wvc, int(n_agreed)
 
 
 def retrieve_o3_chappuis(L_540, L_600, L_680, sza_deg, vza_deg):

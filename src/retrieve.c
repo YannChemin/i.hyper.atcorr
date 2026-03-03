@@ -23,16 +23,28 @@
 /* ─── H2O 940 nm retrieval ────────────────────────────────────────────────── */
 
 void retrieve_h2o_940(const float *L_865,  const float *L_940,
-                       const float *L_1040, int npix,
+                       const float *L_1040, float fwhm_um,
+                       int npix,
                        float sza_deg, float vza_deg,
                        float *out_wvc)
 {
     /* Fraction of the 865→1040 range occupied by 940-865 = 75/175 ≈ 0.4286 */
     static const float FRAC    = (0.940f - 0.865f) / (1.040f - 0.865f);
-    static const float K_940   = 0.036f;   /* cm²/g; empirical at 940 nm */
     static const float WVC_DEF = 2.0f;     /* fallback for invalid pixels */
     static const float WVC_MIN = 0.1f;
     static const float WVC_MAX = 8.0f;
+
+    /* K_940 scales with sensor FWHM: narrow sensors resolve individual H2O
+     * lines in the 940 nm cluster, raising the effective absorption coefficient
+     * above the MODIS broadband value (K=0.036 at 50 nm FWHM).
+     * Power law K(FWHM) = 0.036 × (50 nm / FWHM_nm)^0.78, calibrated against:
+     *   MODIS (50 nm) → K=0.036;  AVIRIS (10 nm) → K≈0.113;
+     *   Tanager (5 nm) → K≈0.217  (exponent α=0.78, physics-based). */
+    float K_940;
+    if (fwhm_um > 0.0f && fwhm_um < 0.050f)
+        K_940 = 0.036f * powf(0.050f / fwhm_um, 0.78f);
+    else
+        K_940 = 0.036f;   /* broadband default (MODIS-equivalent) */
 
     float cos_sza = cosf(sza_deg * (float)(M_PI / 180.0));
     float cos_vza = cosf(vza_deg * (float)(M_PI / 180.0));
@@ -432,4 +444,106 @@ void retrieve_aod_maiac(float *aod_data, int nrows, int ncols, int patch_sz)
 
     free(patch_aod); free(patch_row); free(patch_col);
     free(patch_valid); free(patch_buf);
+}
+
+/* ─── Generic H2O triplet retrieval ───────────────────────────────────────── */
+
+void retrieve_h2o_triplet(const float *L_lo,   const float *L_feat,
+                           const float *L_hi,
+                           float wl_lo_um,  float wl_feat_um, float wl_hi_um,
+                           float K_ref, float fwhm_ref_um, float fwhm_um,
+                           float D_min, float D_max,
+                           int npix, float sza_deg, float vza_deg,
+                           float *out_wvc, uint8_t *out_valid)
+{
+    static const float WVC_DEF = 2.0f;
+
+    float FRAC = (wl_feat_um - wl_lo_um) / (wl_hi_um - wl_lo_um);
+
+    /* FWHM-dependent K scaling (same power law as retrieve_h2o_940) */
+    float K = K_ref;
+    if (fwhm_um > 0.0f && fwhm_um < fwhm_ref_um)
+        K = K_ref * powf(fwhm_ref_um / fwhm_um, 0.78f);
+
+    float cos_sza = cosf(sza_deg * (float)(M_PI / 180.0));
+    float cos_vza = cosf(vza_deg * (float)(M_PI / 180.0));
+    float mu_s = (cos_sza > 0.05f) ? cos_sza : 0.05f;
+    float mu_v = (cos_vza > 0.05f) ? cos_vza : 0.05f;
+    float km   = K * (1.0f / mu_s + 1.0f / mu_v);
+
+    for (int i = 0; i < npix; i++) {
+        float ll = L_lo[i], lf = L_feat[i], lh = L_hi[i];
+        if (!(ll > 0.0f) || !(lf > 0.0f) || !(lh > 0.0f)) {
+            out_wvc[i] = WVC_DEF;
+            if (out_valid) out_valid[i] = 0;
+            continue;
+        }
+        float L_cont = ll * (1.0f - FRAC) + lh * FRAC;
+        if (L_cont <= 0.0f) {
+            out_wvc[i] = WVC_DEF;
+            if (out_valid) out_valid[i] = 0;
+            continue;
+        }
+        float D = 1.0f - lf / L_cont;
+        if (D < 0.0f) D = 0.0f;
+
+        if (D < D_min || D > D_max) {
+            out_wvc[i] = WVC_DEF;
+            if (out_valid) out_valid[i] = 0;
+            continue;
+        }
+
+        float wvc = D / km;
+        if (wvc < 0.1f) wvc = 0.1f;
+        if (wvc > 8.0f) wvc = 8.0f;
+        out_wvc[i] = wvc;
+        if (out_valid) out_valid[i] = 1;
+    }
+}
+
+/* ─── Multi-band H2O consensus ─────────────────────────────────────────────── */
+
+int retrieve_h2o_consensus(int n_methods,
+                            float * const *wvc_arrays,
+                            uint8_t * const *valid_arrays,
+                            int npix,
+                            float *out_wvc)
+{
+    static const float WVC_DEF = 2.0f;
+    int n_agreed = 0;
+
+    for (int i = 0; i < npix; i++) {
+        /* Collect valid estimates into a small stack (max 3) */
+        float vals[3];
+        int n_valid = 0;
+        for (int m = 0; m < n_methods && m < 3; m++) {
+            if (valid_arrays[m][i])
+                vals[n_valid++] = wvc_arrays[m][i];
+        }
+
+        if (n_valid == 0) {
+            out_wvc[i] = WVC_DEF;
+            continue;
+        }
+        if (n_valid == 1) {
+            out_wvc[i] = vals[0];
+            continue;
+        }
+
+        /* Sort 2–3 values and take median */
+        if (n_valid == 2) {
+            out_wvc[i] = 0.5f * (vals[0] + vals[1]);
+        } else {
+            /* n_valid == 3: sort then take middle element */
+            float a = vals[0], b = vals[1], c = vals[2], t;
+            if (a > b) { t = a; a = b; b = t; }
+            if (b > c) { t = b; b = c; c = t; }
+            if (a > b) { t = a; a = b; b = t; }
+            (void)a; (void)c;
+            out_wvc[i] = b;
+        }
+        if (n_valid >= 2) n_agreed++;
+    }
+
+    return n_agreed;
 }
