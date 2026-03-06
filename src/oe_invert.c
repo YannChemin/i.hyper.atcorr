@@ -66,11 +66,15 @@ void oe_invert_aod_h2o(
         float             sigma_aod,
         float             sigma_h2o,
         float             sigma_spec,
+        float             fwhm_940_um,
         float            *out_aod,
         float            *out_h2o)
 {
-    /* Precompute H₂O constants for the J_h2o term */
-    static const float K_940 = 0.036f;
+    /* K₉₄₀ scaled by sensor FWHM (same power law as retrieve_h2o_triplet, α=0.90).
+     * Tanager 6.8 nm → K≈0.217; MODIS 50 nm → K=0.036. */
+    float K_940 = (fwhm_940_um > 0.0f && fwhm_940_um < 0.050f)
+                  ? 0.036f * powf(0.050f / fwhm_940_um, 0.90f)
+                  : 0.036f;
     float cos_sza = cosf(sza_deg * (float)(M_PI / 180.0));
     float cos_vza = cosf(vza_deg * (float)(M_PI / 180.0));
     float mu_s = (cos_sza > 0.05f) ? cos_sza : 0.05f;

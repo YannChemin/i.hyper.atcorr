@@ -72,6 +72,9 @@ extern "C" {
  * \param[in]  sigma_h2o    Prior uncertainty in H₂O [g/cm²] (typical: 1.0).
  * \param[in]  sigma_spec   Observation σ for spectral smoothness cost
  *                          [reflectance units] (typical: 0.01).
+ * \param[in]  fwhm_940_um  FWHM of the 940 nm band [µm]; used to scale K₉₄₀
+ *                          via K = 0.036 × (50 nm / FWHM)^0.90.  Pass 0 to use
+ *                          the MODIS broadband value K=0.036 (no scaling).
  * \param[out] out_aod      Pre-allocated float[npix]; retrieved AOD at 550 nm.
  * \param[out] out_h2o      Pre-allocated float[npix]; retrieved WVC [g/cm²].
  */
@@ -92,6 +95,7 @@ void oe_invert_aod_h2o(
         float             sigma_aod,
         float             sigma_h2o,
         float             sigma_spec,
+        float             fwhm_940_um,
         float            *out_aod,
         float            *out_h2o);
 

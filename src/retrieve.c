@@ -37,12 +37,15 @@ void retrieve_h2o_940(const float *L_865,  const float *L_940,
     /* K_940 scales with sensor FWHM: narrow sensors resolve individual H2O
      * lines in the 940 nm cluster, raising the effective absorption coefficient
      * above the MODIS broadband value (K=0.036 at 50 nm FWHM).
-     * Power law K(FWHM) = 0.036 × (50 nm / FWHM_nm)^0.78, calibrated against:
-     *   MODIS (50 nm) → K=0.036;  AVIRIS (10 nm) → K≈0.113;
-     *   Tanager (5 nm) → K≈0.217  (exponent α=0.78, physics-based). */
+     * Power law K(FWHM) = 0.036 × (50 nm / FWHM_nm)^0.90, calibrated against:
+     *   MODIS (50 nm) → K=0.036;  Tanager (6.8 nm) → K≈0.217
+     *   (empirical: D=0.718 at WVC=1.54 g/cm², SZA=29.3°, VZA=3.1°).
+     *   Exponent α=0.90 = log(0.217/0.036)/log(50/6.8) corrects for
+     *   spectral line saturation: H₂O lines are narrower than 5–8 nm FWHM,
+     *   so K changes faster with FWHM than α=0.78 predicts in this range. */
     float K_940;
     if (fwhm_um > 0.0f && fwhm_um < 0.050f)
-        K_940 = 0.036f * powf(0.050f / fwhm_um, 0.78f);
+        K_940 = 0.036f * powf(0.050f / fwhm_um, 0.90f);
     else
         K_940 = 0.036f;   /* broadband default (MODIS-equivalent) */
 
@@ -460,10 +463,10 @@ void retrieve_h2o_triplet(const float *L_lo,   const float *L_feat,
 
     float FRAC = (wl_feat_um - wl_lo_um) / (wl_hi_um - wl_lo_um);
 
-    /* FWHM-dependent K scaling (same power law as retrieve_h2o_940) */
+    /* FWHM-dependent K scaling (same power law as retrieve_h2o_940, α=0.90) */
     float K = K_ref;
     if (fwhm_um > 0.0f && fwhm_um < fwhm_ref_um)
-        K = K_ref * powf(fwhm_ref_um / fwhm_um, 0.78f);
+        K = K_ref * powf(fwhm_ref_um / fwhm_um, 0.90f);
 
     float cos_sza = cosf(sza_deg * (float)(M_PI / 180.0));
     float cos_vza = cosf(vza_deg * (float)(M_PI / 180.0));
@@ -546,4 +549,77 @@ int retrieve_h2o_consensus(int n_methods,
     }
 
     return n_agreed;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * DASF retrieval — Directional Area Scattering Factor (Knyazikhin 2013)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * PROSPECT-D leaf albedo (R_leaf + T_leaf) at 5 nm steps, 705–795 nm.
+ * Source: PROSPECT-D (Féret et al. 2017), Cab=40 µg/cm², Car=8,
+ *         Cw=0.013, Cm=0.010, N=1.5.
+ * These represent the combined reflectance + transmittance of a single leaf
+ * in the NIR plateau where the canopy radiative transfer is nearly conservative
+ * (ω_L ≈ 0.90), making the spectral invariant approach well-conditioned.
+ */
+static const float LEAF_ALB_WL_NM[] = {
+    705.0f, 710.0f, 715.0f, 720.0f, 725.0f, 730.0f, 735.0f,
+    740.0f, 745.0f, 750.0f, 755.0f, 760.0f, 765.0f, 770.0f,
+    775.0f, 780.0f, 785.0f, 790.0f, 795.0f
+};
+static const float LEAF_ALB_VAL[] = {
+    0.740f, 0.770f, 0.808f, 0.840f, 0.865f, 0.881f, 0.892f,
+    0.900f, 0.906f, 0.910f, 0.912f, 0.912f, 0.911f, 0.911f,
+    0.910f, 0.909f, 0.908f, 0.907f, 0.906f
+};
+#define N_LEAF_ALB 19
+
+float leaf_albedo_nir(float wl_um)
+{
+    float wl_nm = wl_um * 1000.0f;
+    if (wl_nm < LEAF_ALB_WL_NM[0] || wl_nm > LEAF_ALB_WL_NM[N_LEAF_ALB - 1])
+        return -1.0f;   /* outside table: signal to caller */
+
+    /* Linear interpolation */
+    int lo = 0;
+    while (lo < N_LEAF_ALB - 2 && LEAF_ALB_WL_NM[lo + 1] <= wl_nm)
+        lo++;
+    float dx = LEAF_ALB_WL_NM[lo + 1] - LEAF_ALB_WL_NM[lo];
+    float t  = (dx > 0.0f) ? (wl_nm - LEAF_ALB_WL_NM[lo]) / dx : 0.0f;
+    return LEAF_ALB_VAL[lo] * (1.0f - t) + LEAF_ALB_VAL[lo + 1] * t;
+}
+
+void retrieve_dasf(const float *refl, const float *wl_dasf, int n_dasf,
+                   int npix, float *out_dasf)
+{
+    /* DASF = Σ(ρ · ω_L) / Σ(ω_L²)  [linear least-squares, ω_L as predictor]
+     * Knyazikhin et al. (2013) PNAS: ρ(λ) = DASF · ω_L(λ) in the NIR plateau.
+     * We accumulate per band; refl is band-major [n_dasf × npix]. */
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < npix; i++) {
+        float sum_xy = 0.0f;   /* Σ ρ · ω_L */
+        float sum_yy = 0.0f;   /* Σ ω_L²    */
+        int   n_valid = 0;
+
+        for (int b = 0; b < n_dasf; b++) {
+            float omega = leaf_albedo_nir(wl_dasf[b]);
+            if (omega <= 0.0f) continue;
+            float rho = refl[(size_t)b * npix + i];
+            if (!isfinite(rho)) continue;
+            sum_xy += rho   * omega;
+            sum_yy += omega * omega;
+            n_valid++;
+        }
+
+        if (n_valid < 3 || sum_yy < 1e-6f)
+            out_dasf[i] = NAN;
+        else {
+            float d = sum_xy / sum_yy;
+            out_dasf[i] = (d < 0.01f) ? 0.01f : (d > 1.0f) ? 1.0f : d;
+        }
+    }
 }

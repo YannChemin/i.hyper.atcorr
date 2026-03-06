@@ -48,7 +48,14 @@ extern "C" {
  *   \quad D = \max(0,\; 1 - L_{940}/L_{cont})
  *   \quad WVC = D \;/\; (K_{940} \cdot m)
  * \f]
- * with K₉₄₀ = 0.036 cm²/g and m = 1/cos(SZA) + 1/cos(VZA).
+ * with m = 1/cos(SZA) + 1/cos(VZA), and K₉₄₀ scaled by sensor FWHM:
+ * \f[
+ *   K_{940}(\Delta\lambda) = 0.036 \left(\frac{50\,\mathrm{nm}}{\Delta\lambda}\right)^{0.90}
+ * \f]
+ * Calibrated against MODIS (50 nm, K=0.036) and Tanager (6.8 nm, K≈0.217;
+ * empirical: D=0.718, WVC=1.54 g/cm², Kanpur 2025-03-21).  Exponent α=0.90
+ * corrects for spectral line saturation in the 5–8 nm FWHM regime.
+ * Pass fwhm_um = 0 to use the broadband default K=0.036 (MODIS-equivalent).
  *
  * NaN or non-positive radiance pixels default to 2.0 g/cm².
  * Output is clamped to [0.1, 8.0] g/cm².
@@ -56,13 +63,15 @@ extern "C" {
  * \param[in]  L_865    Per-pixel TOA radiance near 865 nm [npix].
  * \param[in]  L_940    Per-pixel TOA radiance near 940 nm [npix].
  * \param[in]  L_1040   Per-pixel TOA radiance near 1040 nm [npix].
+ * \param[in]  fwhm_um  FWHM of the 940 nm band in µm (0 = use default K).
  * \param[in]  npix     Number of pixels.
  * \param[in]  sza_deg  Solar zenith angle [degrees].
  * \param[in]  vza_deg  View zenith angle [degrees].
  * \param[out] out_wvc  Pre-allocated float[npix]; WVC [g/cm²] per pixel.
  */
 void retrieve_h2o_940(const float *L_865,  const float *L_940,
-                       const float *L_1040, int npix,
+                       const float *L_1040, float fwhm_um,
+                       int npix,
                        float sza_deg, float vza_deg,
                        float *out_wvc);
 
@@ -228,6 +237,110 @@ void retrieve_quality_mask(const float *L_blue, const float *L_red,
  * \see Lyapustin, A. et al. (2011), MAIAC. JGR 116, D05203.
  */
 void retrieve_aod_maiac(float *aod_data, int nrows, int ncols, int patch_sz);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * DASF retrieval — Directional Area Scattering Factor
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * \brief PROSPECT-D leaf single-scattering albedo (R+T) via linear interpolation.
+ *
+ * Table covers 705–795 nm at 5 nm steps (Féret et al. 2017, Cab=40).
+ *
+ * \param[in] wl_um  Wavelength in µm.
+ * \return Leaf albedo ω_L ∈ [0.74, 0.912]; -1 if outside table range.
+ */
+float leaf_albedo_nir(float wl_um);
+
+/**
+ * \brief Per-pixel DASF retrieval from corrected BRF in the 710–790 nm NIR plateau.
+ *
+ * Directional Area Scattering Factor (Knyazikhin et al. 2013 PNAS):
+ * \f[
+ *   \rho(\lambda) \approx \mathrm{DASF} \cdot \omega_L(\lambda)
+ * \f]
+ * Solved as linear least squares: \f$\mathrm{DASF} = \Sigma(\rho\,\omega_L) / \Sigma(\omega_L^2)\f$.
+ *
+ * Output is NaN for pixels with fewer than 3 valid bands or near-zero denominator.
+ * Values are clipped to [0.01, 1.0].
+ *
+ * \param[in]  refl      Pre-corrected BRF, band-major order [n_dasf × npix].
+ * \param[in]  wl_dasf   Wavelengths of the DASF bands [µm], length \p n_dasf.
+ * \param[in]  n_dasf    Number of DASF bands (those within 710–790 nm).
+ * \param[in]  npix      Number of pixels.
+ * \param[out] out_dasf  Caller-allocated float[npix]; DASF per pixel.
+ *
+ * \see Knyazikhin, Y. et al. (2013) PNAS 110, E185–E192.
+ */
+void retrieve_dasf(const float *refl, const float *wl_dasf, int n_dasf,
+                   int npix, float *out_dasf);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Generic H₂O triplet retrieval (any absorption feature)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * \brief Per-pixel H₂O retrieval from any (lo, feat, hi) wavelength triplet.
+ *
+ * Continuum interpolation:
+ * \f[
+ *   L_{cont} = L_{lo}(1-f) + L_{hi}\,f,\quad
+ *   f = \frac{\lambda_{feat}-\lambda_{lo}}{\lambda_{hi}-\lambda_{lo}}
+ * \f]
+ * \f[
+ *   D = \max(0,\; 1 - L_{feat}/L_{cont}), \quad
+ *   WVC = D \;/\; (K \cdot m)
+ * \f]
+ * K is scaled from K_ref using the same power law as retrieve_h2o_940():
+ * K = K_ref × (fwhm_ref / fwhm)^0.90 when fwhm < fwhm_ref; otherwise K = K_ref.
+ *
+ * Pixels with D ∉ [D_min, D_max] or non-positive radiance are marked invalid
+ * and assigned WVC = 2.0 g/cm² (fallback).
+ *
+ * \param[in]  L_lo, L_feat, L_hi  Per-pixel TOA radiance at the triplet bands [npix].
+ * \param[in]  wl_lo_um, wl_feat_um, wl_hi_um  Band centre wavelengths [µm].
+ * \param[in]  K_ref       Broadband reference absorption coefficient [cm²/g].
+ * \param[in]  fwhm_ref_um FWHM of the reference sensor [µm].
+ * \param[in]  fwhm_um     Actual sensor FWHM [µm]; 0 = use K_ref directly.
+ * \param[in]  D_min       Minimum valid band depth (below = too noisy).
+ * \param[in]  D_max       Maximum valid band depth (above = saturation).
+ * \param[in]  npix        Number of pixels.
+ * \param[in]  sza_deg     Solar zenith angle [degrees].
+ * \param[in]  vza_deg     View zenith angle [degrees].
+ * \param[out] out_wvc     Pre-allocated float[npix]; WVC [g/cm²] per pixel.
+ * \param[out] out_valid   Pre-allocated uint8_t[npix]; 1=valid, 0=excluded (may be NULL).
+ */
+void retrieve_h2o_triplet(const float *L_lo,   const float *L_feat,
+                           const float *L_hi,
+                           float wl_lo_um,  float wl_feat_um, float wl_hi_um,
+                           float K_ref, float fwhm_ref_um, float fwhm_um,
+                           float D_min, float D_max,
+                           int npix, float sza_deg, float vza_deg,
+                           float *out_wvc, uint8_t *out_valid);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Multi-band H₂O consensus
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * \brief Per-pixel median consensus across multiple H₂O retrieval estimates.
+ *
+ * For each pixel, collects valid estimates (where valid_arrays[m][i] != 0),
+ * computes the median (exact for 2–3 values), and writes it to out_wvc.
+ * Falls back to WVC = 2.0 g/cm² where no estimate is valid.
+ *
+ * \param[in]  n_methods     Number of retrieval methods (max 3 used for median).
+ * \param[in]  wvc_arrays    Array of n_methods pointers to float[npix] WVC arrays.
+ * \param[in]  valid_arrays  Array of n_methods pointers to uint8_t[npix] validity flags.
+ * \param[in]  npix          Number of pixels.
+ * \param[out] out_wvc       Pre-allocated float[npix]; consensus WVC [g/cm²].
+ * \return Number of pixels where at least 2 estimates agreed (n_valid ≥ 2).
+ */
+int retrieve_h2o_consensus(int n_methods,
+                            float * const *wvc_arrays,
+                            uint8_t * const *valid_arrays,
+                            int npix,
+                            float *out_wvc);
 
 #ifdef __cplusplus
 }

@@ -559,6 +559,7 @@ _lib.oe_invert_aod_h2o.argtypes = [
     ctypes.c_float,                  # sigma_aod
     ctypes.c_float,                  # sigma_h2o
     ctypes.c_float,                  # sigma_spec
+    ctypes.c_float,                  # fwhm_940_um
     ctypes.POINTER(ctypes.c_float),  # out_aod
     ctypes.POINTER(ctypes.c_float),  # out_h2o
 ]
@@ -911,6 +912,7 @@ def oe_invert_aod_h2o(cfg, lut_arrays, rho_toa_vis, vis_wl,
                        sza_deg, vza_deg,
                        aod_prior, h2o_prior,
                        sigma_aod=0.5, sigma_h2o=1.0, sigma_spec=0.01,
+                       fwhm_940_um=0.0,
                        L_865=None, L_940=None, L_1040=None):
     """Joint per-pixel AOD + H₂O MAP retrieval via grid-search OE.
 
@@ -988,6 +990,7 @@ def oe_invert_aod_h2o(cfg, lut_arrays, rho_toa_vis, vis_wl,
         float(sza_deg), float(vza_deg),
         float(aod_prior), float(h2o_prior),
         float(sigma_aod), float(sigma_h2o), float(sigma_spec),
+        float(fwhm_940_um),
         out_aod.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         out_h2o.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
     )

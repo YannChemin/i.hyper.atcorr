@@ -203,8 +203,31 @@ Set `LutConfig.aerosol_type = AEROSOL_CUSTOM` (value 9) and call
 `sixs_mie_init()` on the per-thread context before computing the LUT
 to use a custom particle size distribution.
 
-Typical continental mineral dust values: `r_mode = 0.07 µm`,
-`sigma_g = 2.0`, `m_r = 1.53`, `m_i = 0.008`.
+**From the GRASS module**, use `aerosol=custom` with the four companion options:
+
+```
+aerosol=custom  mie_r=0.10  mie_sigma=1.50  mie_mr=1.50  mie_mi=0.015
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `mie_r=` | 0.10 | Log-normal mode radius [µm] (AERONET fine-mode: 0.08–0.15 µm) |
+| `mie_sigma=` | 1.50 | Geometric standard deviation σ_g (typical: 1.4–1.8) |
+| `mie_mr=` | 1.45 | Real refractive index at 550 nm (dust≈1.55, carbon≈1.75, marine≈1.38) |
+| `mie_mi=` | 0.005 | Imaginary refractive index at 550 nm (absorbing: 0.01–0.05; scattering: <0.005) |
+
+Typical values for common aerosol types:
+
+| Type | r_mode | σ_g | n_r | n_i | Ångström α | SSA |
+|------|--------|-----|-----|-----|------------|-----|
+| Kanpur urban/pollution (AERONET fine) | 0.10 | 1.50 | 1.50 | 0.015 | ~1.8 | ~0.91 |
+| Biomass burning | 0.12 | 1.60 | 1.54 | 0.025 | ~1.6 | ~0.87 |
+| Continental mineral dust | 0.07 | 2.00 | 1.53 | 0.008 | ~0.3 | ~0.97 |
+| Clean marine | 0.10 | 1.45 | 1.38 | 0.001 | ~1.0 | ~0.99 |
+
+The Ångström exponent α controls how steeply AOD increases toward the blue.
+Fine-mode (small r) raises α and thus path radiance in the 470 nm band
+relative to the standard continental model (α≈0.5 from 70% coarse dust).
 
 ### BRDF surface models (Phase 5) and BRDF-RT coupling
 
@@ -397,20 +420,31 @@ where *m* = 1/cos(θₛ) + 1/cos(θᵥ) is the two-way airmass factor.
 The result (scene-mean DU) replaces the `ozone=` value for LUT computation.
 Requires input= and band wavelength metadata in the cube.
 
-### `-w` — Column water vapour from 940 nm band depth
+### `-w` — Column water vapour from multi-band consensus
 
-Estimates per-pixel water vapour column [g/cm²] from the 940 nm absorption
-feature using the **Kaufman & Gao (1992)** continuum interpolation:
+Estimates per-pixel water vapour column [g/cm²] from **three H₂O absorption
+features** simultaneously and combines them into a per-pixel consensus
+using `retrieve_h2o_triplet()` + `retrieve_h2o_consensus()`:
+
+| Feature | Triplet (lo / feat / hi) | K_ref (cm²/g) | fwhm_ref | K at 5 nm FWHM |
+|---------|--------------------------|---------------|----------|----------------|
+| 720 nm  | 700 / 720 / 740 nm       | 0.0077        | 60 nm    | 0.054          |
+| 940 nm  | 865 / 941 / 1042 nm      | 0.036         | 50 nm    | 0.217          |
+| 1135 nm | 1100 / 1135 / 1175 nm    | 0.0376        | 45 nm    | 0.209          |
+
+Per-pixel continuum interpolation and band-depth inversion (Kaufman & Gao 1992):
 
 ```
-L_cont = linear_interp(L_865, L_1040) at 940 nm
-D      = max(0, 1 − L_940 / L_cont)
-WVC    = D / (K₉₄₀ × m)     K₉₄₀ = 0.036 cm²/g
+L_cont = L_lo × (1-FRAC) + L_hi × FRAC    (FRAC = (λ_feat−λ_lo)/(λ_hi−λ_lo))
+D      = max(0, 1 − L_feat / L_cont)
+K      = K_ref × (fwhm_ref / fwhm)^0.78   (FWHM power-law scaling, α=0.78)
+WVC    = D / (K × m)                       (m = 1/cos θₛ + 1/cos θᵥ)
 ```
 
-The per-pixel WVC map replaces `h2o_val=` as the correction input.
-The scene mean updates `h2o_val=` as the scalar fallback.
-Requires input= and band wavelength metadata.
+Pixels with D outside the valid range ([0.02, 0.60] / [0.05, 0.90] / [0.05, 0.85])
+are excluded from that feature's estimate.  The per-pixel consensus is the
+median of the valid estimates (1–3 features).  The scene mean updates
+`h2o_val=` as the scalar fallback.  Requires `input=` with wavelength metadata.
 
 ### `-a` — AOD from Dark Dense Vegetation (DDV)
 
@@ -452,10 +486,32 @@ The retrieval functions are also available from `libatcorr.so`:
 ```c
 #include "retrieve.h"
 
-/* H2O column [g/cm²] per pixel from 940 nm band depth */
+/* H2O column [g/cm²] per pixel from a single (lo/feat/hi) band triplet.
+ * K_ref is the broadband reference absorption coefficient [cm²/g].
+ * fwhm_ref_um is the sensor FWHM for K_ref; fwhm_um is the actual sensor FWHM
+ * (0 = use K_ref directly without FWHM scaling).
+ * Pixels with D outside [D_min, D_max] are flagged invalid (out_valid=0). */
+void retrieve_h2o_triplet(const float *L_lo, const float *L_feat,
+                           const float *L_hi,
+                           float wl_lo_um, float wl_feat_um, float wl_hi_um,
+                           float K_ref, float fwhm_ref_um, float fwhm_um,
+                           float D_min, float D_max,
+                           int npix, float sza_deg, float vza_deg,
+                           float *out_wvc, uint8_t *out_valid);
+
+/* Per-pixel median consensus of n_methods WVC arrays.
+ * Only pixels flagged valid (valid_arrays[i][px]=1) contribute.
+ * Falls back to WVC_DEF=2.0 where no estimate is valid.
+ * Returns the number of pixels with at least two agreeing estimates. */
+int retrieve_h2o_consensus(int n_methods,
+                            float * const *wvc_arrays,
+                            uint8_t * const *valid_arrays,
+                            int npix, float *out_wvc);
+
+/* H2O column [g/cm²] per pixel from 940 nm band depth (legacy single-band) */
 void retrieve_h2o_940(const float *L_865, const float *L_940,
                        const float *L_1040, int npix,
-                       float sza_deg, float vza_deg,
+                       float sza_deg, float vza_deg, float fwhm_um,
                        float *out_wvc);
 
 /* Per-pixel AOD at 550 nm from DDV; returns scene mean */
@@ -558,6 +614,8 @@ and climate zone described.
 | 12. O₂-A pressure | `-p quality=` | Mountainous scene; per-pixel pressure and pre-correction masking |
 | 13. MAIAC patch AOD | `-a maiac_patch=` | Dense vegetation; spatial patch regularization of DDV outliers |
 | 14. Joint OE | `-e -w oe_sigma_aod=` | Most accurate simultaneous AOD+H₂O inversion; supersedes -a and -w |
+| 15. FlexBRDF NBAR | `mcd43_fiso= mcd43_fvol= mcd43_fgeo= mcd43_alpha=` | Spectrally-varying NBAR across 400–2500 nm from MCD43 disaggregation + Tikhonov smoothing |
+| 16. DASF retrieval | `-D dasf=` | Canopy structure parameter from 710–790 nm NIR plateau regression; NDVI-masked to vegetation |
 
 ---
 
@@ -1352,6 +1410,173 @@ i.hyper.atcorr \
 
 ---
 
+### 15. FlexBRDF — spectrally-varying NBAR from MCD43 disaggregation
+
+**Scene**: EnMAP over a mixed temperate landscape (Central Europe, DOY 160,
+SZA = 35°).  Standard scalar NBAR (Example 11) applies the same f_iso/f_vol/f_geo
+value at every wavelength.  FlexBRDF disaggregates 7-band MCD43A1 kernel weights
+to the full 400–2500 nm range, then applies Tikhonov second-difference smoothing
+to produce physically consistent spectral kernel weight curves — essential for
+cross-band consistency in hyperspectral time series.
+
+```sh
+# Step 1: Obtain MCD43A1 kernel weights for the 7 MODIS bands.
+# Values here are scene-mean floats parsed from a mixed grassland/crop tile
+# (scale factor 0.001 already applied; bands in order B3,B4,B1,B2,B5,B6,B7).
+# Wavelengths: 469, 555, 645, 858, 1240, 1640, 2130 nm.
+
+FISO="0.112,0.117,0.095,0.243,0.155,0.118,0.085"   # isotropic kernel
+FVOL="0.045,0.040,0.038,0.131,0.038,0.022,0.014"   # Ross-Thick volumetric
+FGEO="0.017,0.014,0.012,0.052,0.016,0.009,0.006"   # Li-Sparse geometric
+
+# Step 2: Atmospheric correction + spectrally-resolved NBAR normalization.
+# mcd43_fiso/fvol/fgeo= accept 7 comma-separated floats at the MODIS wavelengths.
+# mcd43_alpha=0.10: Tikhonov regularization strength (~0.05-0.2 typical).
+# brdf_fiso= etc. can additionally supply per-pixel spatial amplitude rasters;
+# if omitted, the scene-mean spectral kernel weights are used for all pixels.
+i.hyper.atcorr -w -a \
+    input=enmap_radiance output=enmap_nbar \
+    lut=enmap.lut \
+    sza=35 vza=4 raa=110 doy=160 \
+    atmosphere=us62 aerosol=continental \
+    aod=0.0,0.05,0.1,0.2,0.5 \
+    h2o=0.5,1.0,2.0,3.5 \
+    aod_val=0.12 h2o_val=1.8 \
+    sun_azimuth=155 \
+    view_zenith=enmap_vza view_azimuth=enmap_vaa \
+    mcd43_fiso="$FISO" \
+    mcd43_fvol="$FVOL" \
+    mcd43_fgeo="$FGEO" \
+    mcd43_alpha=0.10 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005
+
+# With per-pixel spatial amplitude rasters (from Example 11 workflow):
+# brdf_fiso=mcd43_fiso_raster brdf_fvol=mcd43_fvol_raster brdf_fgeo=mcd43_fgeo_raster
+# The spectral shape comes from mcd43_fiso/fvol/fgeo= (7-band scalars);
+# the per-pixel spatial amplitude comes from brdf_fiso=/fvol=/fgeo= (2D rasters).
+# Combined: f_iso_eff(x,y,λ) = fiso_raster(x,y) × fiso_wl(λ) / fiso_wl(858 nm)
+```
+
+**FlexBRDF algorithm** (Queally et al. 2022; Garcia-Beltran et al. 2024):
+
+1. **Piecewise-linear interpolation**: the 7 MCD43A1 kernel weights at MODIS band
+   centres {0.469, 0.555, 0.645, 0.858, 1.240, 1.640, 2.130} µm are interpolated
+   to all `n_wl` sensor wavelengths.  Outside the anchor range, the endpoint value
+   is clamped (constant extrapolation).
+
+2. **Tikhonov second-difference smoothing** (`mcd43_alpha > 0`): solves
+   `(I + α²·D₂ᵀD₂)·x = f` in O(5n) via Cholesky band factorization.
+   D₂ᵀD₂ is 5-diagonal (banded bandwidth 2), making the system SPD.
+   The smoother suppresses ringing at the sparse anchor transitions while
+   preserving the physical spectral shape.
+
+3. **Spectral NBAR**: at band z, pixel i:
+   `f_iso_eff = f_iso_px(i) × fiso_wl(z) / fiso_wl(858 nm)`
+   where `fiso_wl(z)` is the disaggregated spectral shape (normalised to the
+   NIR reference at 858 nm) and `f_iso_px(i)` is the per-pixel spatial amplitude.
+   When only scene-mean kernels are given (no `brdf_fiso=` rasters), `f_iso_px = 1`.
+
+**Tikhonov `mcd43_alpha` tuning**:
+
+| Scene | Recommended alpha | Notes |
+|-------|------------------|-------|
+| Smooth vegetation / soil | 0.05 – 0.10 | Gentle regularization |
+| Mixed land cover | 0.10 – 0.15 | Default; removes anchor interpolation artefacts |
+| Very sparse MCD43 data | 0.20 – 0.30 | Aggressive smoothing; avoids kinks between anchors |
+| Off (raw piecewise-linear) | 0.0 | Not recommended; shows 7 kinks at MODIS wavelengths |
+
+**MCD43A1 source**: LP DAAC, `https://lpdaac.usgs.gov/products/mcd43a1v061/`.
+Scale factor 0.001.  Use the 8-day composite tile nearest in time to the acquisition.
+
+---
+
+### 16. DASF — Directional Area Scattering Factor (canopy structure retrieval)
+
+**Scene**: Tanager over a temperate broadleaf forest (DOY 200, SZA = 30°).
+The DASF exploits the spectral invariance property of vegetation in the 710–790 nm
+NIR plateau where leaf albedo ω_L(λ) is nearly flat and canopy reflectance is
+dominated by the structural scattering factor rather than biochemistry.
+
+```sh
+# DASF retrieval requires atmospheric correction to BOA reflectance first.
+# It runs inline with the correction using the -D flag.
+#
+# The PROSPECT-D leaf albedo table (R+T, Féret et al. 2017, Cab=40 µg/cm²)
+# provides ω_L(λ) at 5 nm steps from 705 to 795 nm.
+# Physics (Knyazikhin et al. 2013): ρ_boa(λ) ≈ DASF × ω_L(λ)
+#   → DASF = Σ[ρ_boa(λ) × ω_L(λ)] / Σ[ω_L(λ)²]  (linear least-squares)
+#   → DASF ∈ [0.01, 1.0]; NaN where NDVI < 0.2 (non-vegetation)
+
+i.hyper.atcorr -z -w -a -D \
+    input=tanager_radiance output=tanager_refl \
+    lut=tanager_dasf.lut \
+    sza=30 vza=4 raa=100 doy=200 \
+    atmosphere=midsum aerosol=continental \
+    aod=0.0,0.05,0.1,0.2,0.4,0.8 \
+    h2o=0.5,1.5,3.0,5.0 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005 \
+    dasf=tanager_dasf
+
+# DASF output: 2D FCELL raster (single band), co-registered with the
+# input scene. Non-vegetation pixels (NDVI < 0.2) are NaN.
+# Inspect the result:
+r.univar map=tanager_dasf
+r.colors map=tanager_dasf color=viridis
+
+# Combine DASF with reflectance for leaf albedo decomposition (Knyazikhin 2013):
+# ω_L_est(λ) = ρ_boa(λ) / DASF  -- at each vegetation pixel
+# This recovers an effective leaf albedo spectrum free of canopy structure effects,
+# enabling LAI / leaf biochemistry retrieval without a canopy RT model.
+```
+
+**DASF physics** (Knyazikhin et al. 2013 PNAS):
+
+The spectral invariance property of vegetation canopies states that in the
+NIR plateau (710–790 nm) where single-scattering albedo ω_L ≈ 0.90:
+
+```
+ρ_boa(λ) = DASF × ω_L(λ) + ε(λ)
+```
+
+where DASF is the **Directional Area Scattering Factor** (a scalar that captures
+the structural angular scattering of the canopy) and ε(λ) is a small spectral
+residual (< 5 % for closed canopies).  DASF is solved per pixel as a
+single-parameter least-squares fit:
+
+```
+DASF = Σ_λ [ρ(λ) × ω_L(λ)] / Σ_λ [ω_L(λ)²]
+```
+
+Implementation:
+- Accumulates `sum_xy += ρ(λ) × ω_L(λ)` and `sum_yy += ω_L(λ)²` on the fly
+  during the band loop (no extra band storage needed)
+- NDVI masking: red (~660 nm) and NIR (~870 nm) bands saved during correction;
+  pixels with NDVI < 0.2 receive NaN in the DASF output
+- Valid threshold: fewer than 3 valid accumulation bands → NaN
+- Range clipping: DASF ∈ [0.01, 1.0] (physical bounds)
+- Leaf albedo table: PROSPECT-D (Féret et al. 2017) at 5 nm steps, 705–795 nm,
+  Cab = 40 µg/cm², Cw = 0.013, Cm = 0.010, N = 1.5
+
+**DASF interpretation**:
+
+| DASF value | Canopy type |
+|-----------|-------------|
+| 0.90 – 1.0 | Dense closed forest (high multiple scattering) |
+| 0.70 – 0.90 | Open forest / tall shrubland |
+| 0.50 – 0.70 | Sparse vegetation / grassland with soil background |
+| < 0.50 | Very sparse or mixed pixel (treat with caution) |
+
+**Notes**:
+- DASF is only meaningful for pixels where NDVI ≥ 0.2 and the canopy is
+  vegetation-dominated in the 710–790 nm window
+- Combine with FlexBRDF (Example 15) when both NBAR normalization and DASF
+  retrieval are needed: add `mcd43_fiso= mcd43_fvol= mcd43_fgeo=` and `-D dasf=`
+  to the same command
+- The `-D` flag requires that `output=` is specified (correction must run);
+  LUT-only mode does not support DASF
+
+---
+
 ## Fortran 6SV2.1 compatibility
 
 `testsuite/test_fortran_compat.py` (25 tests) cross-checks every C function
@@ -1419,6 +1644,19 @@ grass --tmp-project XY --exec python3 testsuite/test_fortran_compat.py
 - Teillet, P.M., Guindon, B. and Goodenough, D.G. (1982): On the slope-
   aspect correction of multispectral scanner data. *Canadian Journal of
   Remote Sensing*, 8(2), 84–106. (terrain illumination cosine correction)
+- Queally, N. et al. (2022): FlexBRDF: A flexible BRDF correction for
+  grouped processing of airborne imaging spectroscopy flightlines.
+  *Journal of Geophysical Research: Biogeosciences*, 127, e2021JG006545.
+  (FlexBRDF spectral NBAR disaggregation)
+- Garcia-Beltran, A. et al. (2024): HABA: A new hyperspectral albedo-based
+  algorithm for estimating plant area index. *Remote Sensing*, 16, 1405.
+  (FlexBRDF application to hyperspectral BRDF)
+- Knyazikhin, Y. et al. (2013): Hyperspectral remote sensing of foliar
+  nitrogen content. *Proceedings of the National Academy of Sciences*,
+  110(3), E185–E192. (DASF spectral invariance, canopy structure)
+- Féret, J.B. et al. (2017): PROSPECT-D: Towards modeling leaf optical
+  properties through a complete lifecycle. *Remote Sensing of Environment*,
+  193, 204–215. (PROSPECT-D leaf albedo table for DASF)
 
 ## AUTHORS
 

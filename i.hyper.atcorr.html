@@ -103,8 +103,31 @@ default: <tt>us62</tt></dd>
 
 <dt><b>aerosol</b>=<em>string</em></dt>
 <dd>Aerosol type; options: <tt>none</tt>, <tt>continental</tt>,
-<tt>maritime</tt>, <tt>urban</tt>, <tt>desert</tt>;
-default: <tt>continental</tt></dd>
+<tt>maritime</tt>, <tt>urban</tt>, <tt>desert</tt>, <tt>custom</tt>;
+default: <tt>continental</tt>.
+Use <tt>custom</tt> with <tt>mie_r</tt>, <tt>mie_sigma</tt>,
+<tt>mie_mr</tt>, <tt>mie_mi</tt> for a user-specified log-normal
+size distribution (Bohren&ndash;Huffman Mie scattering).</dd>
+
+<dt><b>mie_r</b>=<em>float</em></dt>
+<dd>Custom Mie: log-normal mode radius [&micro;m]; default: <tt>0.10</tt>.
+AERONET fine-mode typically 0.08&ndash;0.15&nbsp;&micro;m. Only used when
+<tt>aerosol=custom</tt>.</dd>
+
+<dt><b>mie_sigma</b>=<em>float</em></dt>
+<dd>Custom Mie: geometric standard deviation &sigma;<sub>g</sub>; default:
+<tt>1.50</tt>. Must be &gt;&nbsp;1.0. Typical range: 1.4&ndash;1.8.
+Only used when <tt>aerosol=custom</tt>.</dd>
+
+<dt><b>mie_mr</b>=<em>float</em></dt>
+<dd>Custom Mie: real refractive index at 550&nbsp;nm; default: <tt>1.45</tt>.
+Reference values: dust&asymp;1.55, carbonaceous&asymp;1.75, marine&asymp;1.38.
+Only used when <tt>aerosol=custom</tt>.</dd>
+
+<dt><b>mie_mi</b>=<em>float</em></dt>
+<dd>Custom Mie: imaginary refractive index at 550&nbsp;nm; default:
+<tt>0.005</tt>. Absorbing aerosol: 0.01&ndash;0.05; nearly non-absorbing:
+&lt;&nbsp;0.005. Only used when <tt>aerosol=custom</tt>.</dd>
 
 <dt><b>ozone</b>=<em>float</em></dt>
 <dd>Total ozone column in Dobson units; default: <tt>300</tt></dd>
@@ -165,8 +188,10 @@ using the MODIS dark-target algorithm (470/660/860/2130&nbsp;nm bands).
 Updates <tt>aod_val=</tt> with the scene mean. Requires <tt>input=</tt> with wavelength metadata.</dd>
 
 <dt><b>-w</b></dt>
-<dd>Retrieve per-pixel column water vapour [g/cm&sup2;] from the 940&nbsp;nm absorption
-feature (continuum interpolation: 865/940/1040&nbsp;nm).
+<dd>Retrieve per-pixel column water vapour [g/cm&sup2;] from three H<sub>2</sub>O
+absorption features (720, 940, and 1135&nbsp;nm) using continuum interpolation
+and a per-pixel median consensus. FWHM scaling (K&nbsp;&prop;&nbsp;FWHM<sup>&minus;0.78</sup>)
+is applied automatically from cube metadata.
 Updates <tt>h2o_val=</tt> with the scene mean. Requires <tt>input=</tt> with wavelength metadata.</dd>
 
 <dt><b>-z</b></dt>
@@ -392,9 +417,31 @@ void sixs_mie_init(SixsCtx *ctx,
 Set <tt>LutConfig.aerosol_type = AEROSOL_CUSTOM</tt> (value 9) and call
 <tt>sixs_mie_init()</tt> on the per-thread context before computing the LUT
 to use a custom particle size distribution.
-Typical continental mineral dust values: <tt>r_mode&nbsp;=&nbsp;0.07&nbsp;&micro;m</tt>,
-<tt>sigma_g&nbsp;=&nbsp;2.0</tt>, <tt>m_r&nbsp;=&nbsp;1.53</tt>,
-<tt>m_i&nbsp;=&nbsp;0.008</tt>.
+</p>
+<p>
+<b>From the GRASS module</b>, use <tt>aerosol=custom</tt> with the four companion
+options instead of coding against the C&nbsp;API:
+</p>
+<pre>
+  aerosol=custom  mie_r=0.10  mie_sigma=1.50  mie_mr=1.50  mie_mi=0.015
+</pre>
+<table>
+<tr><th>Type</th><th>r_mode (&micro;m)</th><th>&sigma;<sub>g</sub></th>
+    <th>n<sub>r</sub></th><th>n<sub>i</sub></th>
+    <th>&Aring;ngstr&ouml;m &alpha;</th><th>SSA</th></tr>
+<tr><td>Kanpur urban/pollution (AERONET fine)</td>
+    <td>0.10</td><td>1.50</td><td>1.50</td><td>0.015</td><td>~1.8</td><td>~0.91</td></tr>
+<tr><td>Biomass burning</td>
+    <td>0.12</td><td>1.60</td><td>1.54</td><td>0.025</td><td>~1.6</td><td>~0.87</td></tr>
+<tr><td>Continental mineral dust</td>
+    <td>0.07</td><td>2.00</td><td>1.53</td><td>0.008</td><td>~0.3</td><td>~0.97</td></tr>
+<tr><td>Clean marine</td>
+    <td>0.10</td><td>1.45</td><td>1.38</td><td>0.001</td><td>~1.0</td><td>~0.99</td></tr>
+</table>
+<p>
+Fine-mode aerosol (small r<sub>mode</sub>) gives a high &Aring;ngstr&ouml;m
+exponent &alpha; and thus substantially more path radiance in the blue bands
+compared with the default continental model (&alpha;&asymp;0.5 from 70&nbsp;% coarse dust).
 </p>
 
 <h3>BRDF surface models (Phase 5) and BRDF-RT coupling</h3>
@@ -556,16 +603,34 @@ Scene-mean ozone column is estimated from the Chappuis absorption feature at
   O3     = D / (&sigma;&sub6;&sub0;&sub0; &times; m)    &sigma;&sub6;&sub0;&sub0; &asymp; 1.0&times;10&sup;&minus;&sup4; DU&sup;&minus;&sup1;
 </pre>
 
-<h3>Column water vapour from 940&nbsp;nm (<tt>-w</tt>)</h3>
+<h3>Column water vapour &mdash; multi-band consensus (<tt>-w</tt>)</h3>
 <p>
-Per-pixel WVC is estimated from the 940&nbsp;nm absorption feature using the
-Kaufman &amp; Gao (1992) continuum interpolation:
+Per-pixel WVC is estimated from three H<sub>2</sub>O absorption features
+using the Kaufman &amp; Gao (1992) continuum interpolation,
+with FWHM power-law scaling (K&nbsp;&prop;&nbsp;FWHM<sup>&minus;0.78</sup>):
 </p>
+<table>
+<tr><th>Feature</th><th>Triplet (lo / feat / hi)</th>
+    <th>K<sub>ref</sub> (cm&sup2;/g)</th><th>fwhm<sub>ref</sub></th>
+    <th>K at 5&nbsp;nm FWHM</th><th>Valid D range</th></tr>
+<tr><td>720&nbsp;nm</td><td>700 / 720 / 740&nbsp;nm</td>
+    <td>0.0077</td><td>60&nbsp;nm</td><td>0.054</td><td>0.02&ndash;0.60</td></tr>
+<tr><td>940&nbsp;nm</td><td>865 / 941 / 1042&nbsp;nm</td>
+    <td>0.036</td><td>50&nbsp;nm</td><td>0.217</td><td>0.05&ndash;0.90</td></tr>
+<tr><td>1135&nbsp;nm</td><td>1100 / 1135 / 1175&nbsp;nm</td>
+    <td>0.0376</td><td>45&nbsp;nm</td><td>0.209</td><td>0.05&ndash;0.85</td></tr>
+</table>
 <pre>
-  L_cont = linear_interp(L_865, L_1040) at 940 nm
-  D      = max(0, 1 &minus; L_940 / L_cont)
-  WVC    = D / (K&sub9;&sub4;&sub0; &times; m)    K&sub9;&sub4;&sub0; = 0.036 cm&sup2;/g
+  L_cont = L_lo*(1-FRAC) + L_hi*FRAC    FRAC = (wl_feat-wl_lo)/(wl_hi-wl_lo)
+  D      = max(0, 1 - L_feat/L_cont)
+  K      = K_ref * (fwhm_ref/fwhm)^0.78    (FWHM power-law scaling, alpha=0.78)
+  WVC    = D / (K * m)                      m = 1/cos(sza) + 1/cos(vza)
 </pre>
+<p>
+The per-pixel consensus is the median of valid feature estimates
+(D within the stated range). Pixels where no feature is valid receive
+the scene-mean fallback (2.0&nbsp;g/cm&sup2;).
+</p>
 
 <h3>AOD from Dark Dense Vegetation (<tt>-a</tt>)</h3>
 <p>

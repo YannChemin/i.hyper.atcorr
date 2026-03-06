@@ -150,6 +150,78 @@ parameterisation is least accurate.
 
 ---
 
+## Hyperspectral-Native Features
+
+Two additional features exploit the continuous 400–2500 nm sampling of
+hyperspectral sensors and are only meaningful with 200+ bands.
+
+### FlexBRDF — spectrally-varying NBAR
+
+Standard NBAR applies a single scalar f_iso/f_vol/f_geo at every band.
+**FlexBRDF** (Queally 2022; Garcia-Beltran 2024) disaggregates the 7-band
+MCD43A1 kernel weights to the full hyperspectral grid:
+
+1. Piecewise-linear interpolation between the 7 MODIS band centres
+   {0.469, 0.555, 0.645, 0.858, 1.240, 1.640, 2.130} µm.
+2. Optional **Tikhonov second-difference spectral smoothing** solves
+   `(I + α²·D₂ᵀD₂)·x = f` in O(5n) via Cholesky band factorization,
+   removing the piecewise kinks at anchor points.
+
+```sh
+i.hyper.atcorr -w -a \
+    input=enmap_radiance output=enmap_nbar \
+    lut=enmap.lut \
+    sza=35 vza=4 raa=110 doy=160 \
+    atmosphere=us62 aerosol=continental \
+    aod=0.0,0.05,0.1,0.2,0.5 h2o=0.5,1.0,2.0,3.5 \
+    aod_val=0.12 h2o_val=1.8 \
+    sun_azimuth=155 view_zenith=enmap_vza view_azimuth=enmap_vaa \
+    mcd43_fiso="0.112,0.117,0.095,0.243,0.155,0.118,0.085" \
+    mcd43_fvol="0.045,0.040,0.038,0.131,0.038,0.022,0.014" \
+    mcd43_fgeo="0.017,0.014,0.012,0.052,0.016,0.009,0.006" \
+    mcd43_alpha=0.10 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005
+```
+
+Each of the three comma-separated 7-float strings gives MCD43A1 kernel
+weights (scale factor 0.001 already applied) at the MODIS band centres in
+order B3, B4, B1, B2, B5, B6, B7.  Per-pixel spatial amplitude rasters
+(`brdf_fiso=`, `brdf_fvol=`, `brdf_fgeo=`) can be combined: the effective
+weight at band z and pixel i is `f_iso_px(i) × fiso_wl(z) / fiso_wl(858 nm)`.
+When only scene-mean scalar kernels are given, the per-pixel factor is 1.
+
+### DASF — Directional Area Scattering Factor
+
+**DASF** (Knyazikhin 2013 PNAS) retrieves a canopy structural parameter from
+the 710–790 nm NIR plateau where canopy reflectance is linearly proportional
+to leaf single-scattering albedo ω_L(λ):
+
+```
+ρ_boa(λ) ≈ DASF × ω_L(λ)
+DASF = Σ[ρ(λ) × ω_L(λ)] / Σ[ω_L(λ)²]   (least-squares)
+```
+
+Leaf albedo ω_L(λ) is taken from a PROSPECT-D table (Féret et al. 2017,
+Cab = 40 µg/cm²) at 5 nm steps.  The DASF raster is NaN for non-vegetation
+pixels (NDVI < 0.2, derived from bands saved during correction) and clipped
+to [0.01, 1.0].
+
+```sh
+i.hyper.atcorr -z -w -a -D \
+    input=tanager_radiance output=tanager_refl \
+    lut=tanager.lut \
+    sza=30 vza=4 raa=100 doy=200 \
+    atmosphere=midsum aerosol=continental \
+    aod=0.0,0.05,0.1,0.2,0.4,0.8 h2o=0.5,1.5,3.0,5.0 \
+    wl_min=0.376 wl_max=2.499 wl_step=0.005 \
+    dasf=tanager_dasf
+```
+
+Output: a 2-D FCELL raster `tanager_dasf`.  DASF ~ 0.9 for dense closed
+forest; ~ 0.5–0.7 for open shrubland; NaN for bare soil, water, urban.
+
+---
+
 ## Installation
 
 ### Prerequisites
@@ -252,8 +324,9 @@ i.hyper.atcorr -z -w -a \
 
 - **`-z`** retrieves scene-mean O₃ (DU) from Chappuis absorption at 600 nm;
   replaces `ozone=` before the LUT is computed
-- **`-w`** retrieves per-pixel WVC (g/cm²) from the 940 nm band depth
-  (continuum from 865/1040 nm shoulders); used in place of `h2o_val=`
+- **`-w`** retrieves per-pixel WVC (g/cm²) from three H₂O absorption features
+  (720, 940, 1135 nm) with FWHM power-law K scaling (α=0.78) and a per-pixel
+  median consensus; used in place of `h2o_val=`
 - **`-a`** retrieves per-pixel AOD at 550 nm from the MODIS DDV algorithm
   (470/660/860/2130 nm); non-DDV pixels receive the scene-mean AOD
 - **`dem=`** computes ISA surface pressure from the mean DEM elevation and
@@ -285,8 +358,12 @@ i.hyper.atcorr -z -w -a \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `atmosphere=` | us62 | Standard atmosphere model |
-| `aerosol=` | continental | Aerosol type |
+| `aerosol=` | continental | Aerosol type: `none`, `continental`, `maritime`, `urban`, `desert`, `custom` |
 | `ozone=` | 300 | Ozone column (Dobson units) |
+| `mie_r=` | 0.10 | Custom Mie: log-normal mode radius [µm] (only when `aerosol=custom`) |
+| `mie_sigma=` | 1.50 | Custom Mie: geometric std dev σ_g > 1 (only when `aerosol=custom`) |
+| `mie_mr=` | 1.45 | Custom Mie: real refractive index at 550 nm (only when `aerosol=custom`) |
+| `mie_mi=` | 0.005 | Custom Mie: imaginary refractive index at 550 nm (only when `aerosol=custom`) |
 
 ### LUT grid
 
@@ -329,9 +406,25 @@ per-pixel arrays used during the correction step.
 | Option / Flag | Description |
 |---------------|-------------|
 | `-z` | Retrieve scene-mean O₃ (DU) from Chappuis band depth at 600 nm; requires bands near 540, 600, 680 nm |
-| `-w` | Retrieve per-pixel WVC (g/cm²) from 940 nm band depth; requires bands near 865, 940, 1040 nm |
+| `-w` | Retrieve per-pixel WVC (g/cm²) from three H₂O features (720/940/1135 nm) with per-pixel median consensus; FWHM scaling applied automatically |
 | `-a` | Retrieve per-pixel AOD at 550 nm from MODIS DDV algorithm; requires bands near 470, 660, 860, 2130 nm |
 | `dem=` | ISA surface pressure from mean elevation of a DEM raster; replaces default 1013.25 hPa |
+
+### FlexBRDF — spectrally-varying NBAR
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `mcd43_fiso=` | — | 7 comma-separated f_iso kernel weights at MODIS band centres (B3,B4,B1,B2,B5,B6,B7); scale factor 0.001 applied |
+| `mcd43_fvol=` | — | 7 comma-separated f_vol kernel weights (must accompany `mcd43_fiso=` and `mcd43_fgeo=`) |
+| `mcd43_fgeo=` | — | 7 comma-separated f_geo kernel weights |
+| `mcd43_alpha=` | 0.10 | Tikhonov second-difference regularization strength (0 = off; 0.05–0.20 typical) |
+
+### DASF retrieval
+
+| Option / Flag | Default | Description |
+|---------------|---------|-------------|
+| `-D` | off | Retrieve DASF (canopy structural scattering factor) inline with correction; requires `output=` and `dasf=` |
+| `dasf=` | — | Output 2-D FCELL raster name for the DASF product; NaN for non-vegetation (NDVI < 0.2) |
 
 ---
 
@@ -351,6 +444,8 @@ src/
 ├── adjacency.c      Vermote 1997 adjacency correction         [#2]
 ├── surface_model.c  3-component surface prior + MAP           [#3,#5,#6]
 ├── uncertainty.c    Noise + AOD-perturbation uncertainty      [#4]
+├── spectral_brdf.c  MCD43 disaggregation + Tikhonov smoother [FlexBRDF]
+├── retrieve.c       Image-based retrieval (H2O/AOD/O3/DASF)
 └── rt.c / scatra.c / ... (6SV RT solver, ported from Fortran)
 
 include/
@@ -358,7 +453,9 @@ include/
 ├── spatial.h        [#1]
 ├── adjacency.h      [#2]
 ├── surface_model.h  [#3,#5,#6]
-└── uncertainty.h    [#4]
+├── uncertainty.h    [#4]
+├── spectral_brdf.h  FlexBRDF (mcd43_disaggregate, spectral_smooth_tikhonov)
+└── retrieve.h       Retrieval API (H2O, AOD, O3, DASF)
 
 main.c               GRASS module interface, correct_raster3d()
 
@@ -463,6 +560,17 @@ by the Python test suite when the Fortran objects are present.
   Atmospheric correction of visible to middle-infrared EOS-MODIS data over
   land surfaces: Background, operational algorithm and validation.
   *J. Geophys. Res. Atmos.*, 102(D14), 17131–17141. (adjacency correction)
+- Queally, N. et al. (2022): FlexBRDF: A flexible BRDF correction for
+  grouped processing of airborne imaging spectroscopy flightlines.
+  *Journal of Geophysical Research: Biogeosciences*, 127, e2021JG006545.
+- Garcia-Beltran, A. et al. (2024): HABA: A new hyperspectral albedo-based
+  algorithm for estimating plant area index. *Remote Sensing*, 16, 1405.
+- Knyazikhin, Y. et al. (2013): Hyperspectral remote sensing of foliar
+  nitrogen content. *Proceedings of the National Academy of Sciences*,
+  110(3), E185–E192. (DASF spectral invariance)
+- Féret, J.B. et al. (2017): PROSPECT-D: Towards modeling leaf optical
+  properties through a complete lifecycle. *Remote Sensing of Environment*,
+  193, 204–215. (PROSPECT-D leaf albedo)
 
 ## Authors
 
