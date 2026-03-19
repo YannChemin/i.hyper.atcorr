@@ -252,8 +252,12 @@ class TestInversion(TestCase):
         np.testing.assert_allclose(rho_boa, rho_toa, atol=1e-5)
 
     def test_atmosphere_reduces_bright_surface(self):
-        """With R_atm > 0 and T < 1, rho_boa < rho_toa for a bright surface."""
-        rho_boa = ac.invert(0.5, 0.10, 0.80, 0.85, 0.10)
+        """Atmosphere with high T removes path radiance: rho_boa < rho_toa.
+
+        Parameters chosen so T_down*T_up ≈ 0.95 >> R_atm/rho_toa, which
+        ensures the atmospheric correction lowers the apparent reflectance.
+        """
+        rho_boa = ac.invert(0.5, 0.10, 0.98, 0.98, 0.05)
         self.assertLess(float(rho_boa), 0.5)
 
     def test_bright_surface_stays_bright(self):
@@ -283,6 +287,157 @@ class TestInversion(TestCase):
         rho_boa = ac.invert(rho_toa, 0.05, 0.90, 0.92, 0.08)
         self.assertEqual(len(rho_boa), 100)
         self.assertTrue(np.all(np.isfinite(rho_boa)))
+
+    def test_forward_inverse_roundtrip(self):
+        """Forward model → invert must recover the original rho_boa within 1e-4."""
+        cfg, lut = _make_lut()
+        sl = ac.lut_slice(cfg, lut, 0.15, 2.0)
+        rho_boa_orig = np.array([0.04, 0.08, 0.15, 0.25], dtype=np.float32)  # n_wl=4
+        # Lambertian forward model: ρ_toa = R_atm + T_dn·T_up·ρ_boa / (1 - s·ρ_boa)
+        rho_toa = (sl.R_atm
+                   + sl.T_down * sl.T_up * rho_boa_orig
+                   / (1.0 - sl.s_alb * rho_boa_orig))
+        rho_boa_rec = ac.invert(rho_toa, sl.R_atm, sl.T_down, sl.T_up, sl.s_alb)
+        np.testing.assert_allclose(
+            rho_boa_rec, rho_boa_orig, rtol=1e-4, atol=1e-5,
+            err_msg="Roundtrip forward→invert failed",
+        )
+
+
+class TestLutSpectralBehavior(TestCase):
+    """Tests for physically expected spectral structure of LUT arrays."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cfg_ray, cls.lut_ray = _make_lut(aerosol_model=0)   # Rayleigh only
+        cls.cfg_co,  cls.lut_co  = _make_lut(aerosol_model=1)   # continental
+
+    def test_R_atm_blue_greater_than_nir_rayleigh(self):
+        """Rayleigh-only R_atm at 450 nm must be >> R_atm at 870 nm (τ ∝ λ⁻⁴)."""
+        R_blue = float(self.lut_ray.R_atm[0, 0, 0])   # AOD=0, H2O=1.0, 450 nm
+        R_nir  = float(self.lut_ray.R_atm[0, 0, -1])  # 870 nm
+        self.assertGreater(
+            R_blue, R_nir * 3.0,
+            msg=f"R_atm(Rayleigh): 450nm={R_blue:.4f}, 870nm={R_nir:.4f} — expected ratio >3",
+        )
+
+    def test_T_total_blue_less_than_nir_rayleigh(self):
+        """Rayleigh extinction: T_down×T_up at 450 nm must be less than at 870 nm."""
+        T_blue = float(self.lut_ray.T_down[0, 0, 0] * self.lut_ray.T_up[0, 0, 0])
+        T_nir  = float(self.lut_ray.T_down[0, 0, -1] * self.lut_ray.T_up[0, 0, -1])
+        self.assertLess(
+            T_blue, T_nir,
+            msg=f"T_total(Rayleigh): 450nm={T_blue:.4f} ≥ 870nm={T_nir:.4f}",
+        )
+
+    def test_aerosol_increases_R_atm_red(self):
+        """Continental aerosol at max AOD must raise R_atm at 650 nm vs Rayleigh-only."""
+        R_ray = float(self.lut_ray.R_atm[-1, 0, 2])  # 650 nm, max AOD
+        R_co  = float(self.lut_co.R_atm[-1, 0, 2])
+        self.assertGreater(
+            R_co, R_ray,
+            msg=f"R_atm(650nm): continental={R_co:.4f} ≤ Rayleigh-only={R_ray:.4f}",
+        )
+
+    def test_R_atm_spectral_ordering_with_aerosol(self):
+        """With continental aerosol at moderate AOD, R_atm(450nm) > R_atm(650nm)."""
+        R_blue = float(self.lut_co.R_atm[1, 0, 0])   # AOD=0.2, 450 nm
+        R_red  = float(self.lut_co.R_atm[1, 0, 2])   # AOD=0.2, 650 nm
+        self.assertGreater(
+            R_blue, R_red,
+            msg=f"R_atm continental: 450nm={R_blue:.4f} ≤ 650nm={R_red:.4f}",
+        )
+
+
+class TestLutGeometrySensitivity(TestCase):
+    """Tests that LUT values respond physically to viewing geometry changes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cfg_lo, cls.lut_lo = _make_lut(sza=20.0)
+        cls.cfg_hi, cls.lut_hi = _make_lut(sza=60.0)
+
+    def test_higher_sza_increases_R_atm(self):
+        """R_atm at 450 nm must be larger for SZA=60° than SZA=20°."""
+        R_lo = float(self.lut_lo.R_atm[1, 0, 0])  # AOD=0.2, H2O=1.0, 450 nm
+        R_hi = float(self.lut_hi.R_atm[1, 0, 0])
+        self.assertGreater(
+            R_hi, R_lo,
+            msg=f"R_atm(450nm): SZA=60°={R_hi:.4f} ≤ SZA=20°={R_lo:.4f}",
+        )
+
+    def test_higher_sza_decreases_T_total(self):
+        """T_down×T_up at 650 nm must decrease for SZA=60° vs SZA=20°.
+
+        650 nm is chosen because aerosol+Rayleigh extinction is strong enough
+        there that the SZA effect is measurable; 550 nm and 450 nm may show
+        partial compensation from enhanced diffuse transmittance.
+        """
+        T_lo = float(self.lut_lo.T_down[1, 0, 2] * self.lut_lo.T_up[1, 0, 2])
+        T_hi = float(self.lut_hi.T_down[1, 0, 2] * self.lut_hi.T_up[1, 0, 2])
+        self.assertLess(
+            T_hi, T_lo,
+            msg=f"T_total(650nm): SZA=60°={T_hi:.4f} ≥ SZA=20°={T_lo:.4f}",
+        )
+
+    def test_nadir_vs_oblique_T_up(self):
+        """T_up must be lower for oblique VZA=50° than for nadir VZA=0°."""
+        _, lut_nadir   = _make_lut(vza=0.0)
+        _, lut_oblique = _make_lut(vza=50.0)
+        T_nadir   = float(lut_nadir.T_up[1, 0, 1])    # AOD=0.2, 550 nm
+        T_oblique = float(lut_oblique.T_up[1, 0, 1])
+        self.assertLess(
+            T_oblique, T_nadir,
+            msg=f"T_up(550nm): VZA=50°={T_oblique:.4f} ≥ VZA=0°={T_nadir:.4f}",
+        )
+
+
+class TestLutH2OSensitivity(TestCase):
+    """Tests for H₂O column influence on transmittances at 940 nm."""
+
+    # Grid including 940 nm (H2O absorption) and 550 nm (transparent window)
+    _WL_H2O = np.array([0.55, 0.87, 0.94, 1.02], dtype=np.float32)
+    _H2O_RANGE = np.array([0.5, 1.0, 2.0, 4.0], dtype=np.float32)
+
+    @classmethod
+    def setUpClass(cls):
+        cfg = ac.LutConfig(**{
+            **_BASE_CFG,
+            "wl":  cls._WL_H2O,
+            "h2o": cls._H2O_RANGE,
+        })
+        cls.lut = ac.compute_lut(cfg)
+
+    def test_T_down_decreases_with_h2o_at_940nm(self):
+        """T_down at 940 nm must decrease monotonically with column H₂O."""
+        T_940 = self.lut.T_down[0, :, 2]   # AOD=0, all H2O, wl=940 nm
+        for k in range(len(self._H2O_RANGE) - 1):
+            self.assertLessEqual(
+                T_940[k + 1], T_940[k] + 1e-4,
+                msg=(
+                    f"T_down(940nm) increased from H2O={self._H2O_RANGE[k]:.1f} "
+                    f"to {self._H2O_RANGE[k+1]:.1f}: "
+                    f"{T_940[k]:.4f} → {T_940[k+1]:.4f}"
+                ),
+            )
+
+    def test_T_down_nearly_constant_at_green_with_h2o(self):
+        """T_down at 550 nm must vary < 2% across the full H₂O range."""
+        T_550_lo = float(self.lut.T_down[0, 0, 0])   # H2O=0.5 g/cm²
+        T_550_hi = float(self.lut.T_down[0, -1, 0])  # H2O=4.0 g/cm²
+        np.testing.assert_allclose(
+            T_550_hi, T_550_lo, rtol=0.02,
+            err_msg=f"T_down(550nm) varies >2% with H2O: {T_550_lo:.4f}→{T_550_hi:.4f}",
+        )
+
+    def test_h2o_effect_larger_at_940_than_550(self):
+        """H₂O sensitivity must be stronger at 940 nm than at 550 nm."""
+        delta_940 = abs(float(self.lut.T_down[0, 0, 2]) - float(self.lut.T_down[0, -1, 2]))
+        delta_550 = abs(float(self.lut.T_down[0, 0, 0]) - float(self.lut.T_down[0, -1, 0]))
+        self.assertGreater(
+            delta_940, delta_550,
+            msg=f"ΔT_down(940nm)={delta_940:.4f} ≤ ΔT_down(550nm)={delta_550:.4f}",
+        )
 
 
 class TestPolarization(TestCase):

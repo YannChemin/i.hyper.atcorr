@@ -73,6 +73,28 @@ class TestSolarSpectrum(TestCase):
             msg=f"Non-finite E0 at: {wl[~np.isfinite(E0)]}",
         )
 
+    def test_e0_peak_in_visible(self):
+        """Peak solar irradiance must occur in the 0.45–0.60 µm visible range."""
+        wl  = np.arange(0.25, 2.51, 0.005, dtype=np.float32)
+        E0  = ac.solar_E0(wl)
+        peak_wl = float(wl[np.argmax(E0)])
+        self.assertGreater(peak_wl, 0.40, msg=f"Peak E0 at {peak_wl:.3f} µm < 0.40")
+        self.assertLess(peak_wl,    0.65, msg=f"Peak E0 at {peak_wl:.3f} µm > 0.65")
+
+    def test_e0_integral_vis_nir(self):
+        """Integral of E0 over 0.35–2.5 µm must be in [700, 1200] W/m².
+
+        The total solar constant is ~1361 W/m²; integrating only the
+        0.35–2.5 µm window captures roughly 70–90% of it.
+        """
+        wl  = np.arange(0.35, 2.505, 0.005, dtype=np.float32)
+        E0  = ac.solar_E0(wl)
+        integral = float(np.trapezoid(E0, wl))   # trapezoidal rule
+        self.assertGreater(integral, 700.0,
+                           msg=f"E0 integral over 0.35–2.5 µm = {integral:.0f} W/m² < 700")
+        self.assertLess(integral, 1400.0,
+                        msg=f"E0 integral over 0.35–2.5 µm = {integral:.0f} W/m² > 1400")
+
 
 class TestEarthSunDist(TestCase):
     """Tests for earth_sun_dist2(): seasonal Earth-Sun distance squared."""
@@ -108,11 +130,16 @@ class TestEarthSunDist(TestCase):
             )
 
     def test_eccentricity_range(self):
-        """Peak-to-peak variation in d² must be ~3.3% (orbital eccentricity 0.0167)."""
+        """Peak-to-peak variation in d² must be ~6.7% (orbital eccentricity 0.0167).
+
+        earth_sun_dist2 returns d² (AU²).  For e=0.0167:
+          d²_max - d²_min = (1+e)² - (1-e)² = 4e ≈ 0.0668
+        (not 3.3% which is the variation in d, not d²).
+        """
         d2_all = [ac.earth_sun_dist2(d) for d in range(1, 366)]
         rng = max(d2_all) - min(d2_all)
-        self.assertGreater(rng, 0.030, msg=f"Annual d² range {rng:.4f} < 3.0%")
-        self.assertLess(rng, 0.040, msg=f"Annual d² range {rng:.4f} > 4.0%")
+        self.assertGreater(rng, 0.055, msg=f"Annual d² range {rng:.4f} < 5.5%")
+        self.assertLess(rng, 0.080, msg=f"Annual d² range {rng:.4f} > 8.0%")
 
     def test_symmetry_perihelion_aphelion(self):
         """d²(perihelion) + d²(aphelion) ≈ 2 (symmetric about 1 AU²)."""

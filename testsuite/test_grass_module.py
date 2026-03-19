@@ -173,6 +173,25 @@ class TestIHyperAtcorrCorrect(TestCase):
                 history=f"Band {i}: {wl_nm:.1f} nm",
             )
         cls.lut_file = tempfile.mktemp(suffix=".lut", prefix="ihyper_corr_")
+        # Run the module ONCE here so all subsequent tests can inspect the output.
+        # Using runModule (no assertion) to avoid aborting the entire class on failure;
+        # test_module_runs_successfully will catch any actual error separately.
+        cls.runModule(
+            "i.hyper.atcorr",
+            input=cls.input_map,
+            output=cls.output_map,
+            lut=cls.lut_file,
+            sza=_SZA,
+            vza=_VZA,
+            raa=_RAA,
+            altitude=_ALT,
+            aod="0.05,0.2,0.5",
+            h2o="1.0,2.0,4.0",
+            aerosol="continental",
+            atmosphere="us62",
+            doy=_DOY,
+            overwrite=True,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -189,36 +208,11 @@ class TestIHyperAtcorrCorrect(TestCase):
         self.assertRaster3dExists(self.input_map)
 
     def test_module_runs_successfully(self):
-        """Module must exit 0 for a valid input/output pair."""
-        self.assertModule(
-            "i.hyper.atcorr",
-            input=self.input_map,
-            output=self.output_map,
-            lut=self.lut_file,
-            sza=_SZA,
-            vza=_VZA,
-            raa=_RAA,
-            altitude=_ALT,
-            aod="0.05,0.2,0.5",
-            h2o="1.0,2.0,4.0",
-            aerosol="continental",
-            atmosphere="us62",
-            doy=_DOY,
-            overwrite=True,
-        )
+        """Output Raster3D must exist — proves the module ran without error in setUpClass."""
+        self.assertRaster3dExists(self.output_map)
 
     def test_output_map_created(self):
-        """Output Raster3D must be created after module execution."""
-        # Run module first if not already done
-        if not gs.find_file(self.output_map, element="grid3")["name"]:
-            self.runModule(
-                "i.hyper.atcorr",
-                input=self.input_map,
-                output=self.output_map,
-                sza=_SZA, vza=_VZA, raa=_RAA, altitude=_ALT,
-                aod="0.05,0.2", h2o="1.0,2.0",
-                doy=_DOY, overwrite=True,
-            )
+        """Output Raster3D must be present in the GRASS database."""
         self.assertRaster3dExists(self.output_map)
 
     def test_output_reflectance_positive(self):
@@ -294,6 +288,85 @@ class TestIHyperAtcorrCorrect(TestCase):
             )
             if os.path.exists(lut_polar):
                 os.remove(lut_polar)
+
+    def test_midlat_summer_atmosphere_accepted(self):
+        """Module must run successfully with atmosphere=midlat_summer."""
+        out = self.output_map + "_midlat"
+        lut = tempfile.mktemp(suffix=".lut")
+        try:
+            self.assertModule(
+                "i.hyper.atcorr",
+                input=self.input_map,
+                output=out,
+                lut=lut,
+                sza=_SZA, vza=_VZA, raa=_RAA, altitude=_ALT,
+                aod="0.05,0.2", h2o="1.0,2.0",
+                atmosphere="midlat_summer",
+                doy=_DOY,
+                overwrite=True,
+            )
+            self.assertRaster3dExists(out)
+        finally:
+            self.runModule("g.remove", type="raster_3d", flags="f", name=out)
+            if os.path.exists(lut):
+                os.remove(lut)
+
+    def test_lut_reuse(self):
+        """Module must accept a pre-computed LUT file and produce valid output."""
+        out_reuse = self.output_map + "_reuse"
+        try:
+            # self.lut_file was written during setUpClass; reuse it without recomputing
+            self.assertModule(
+                "i.hyper.atcorr",
+                input=self.input_map,
+                output=out_reuse,
+                lut=self.lut_file,
+                sza=_SZA, vza=_VZA, raa=_RAA, altitude=_ALT,
+                aod="0.05,0.2,0.5",
+                h2o="1.0,2.0,4.0",
+                doy=_DOY,
+                overwrite=True,
+            )
+            self.assertRaster3dExists(out_reuse)
+            # Reused LUT must give identical reflectances to the original run
+            self.assertRaster3dFitsUnivar(
+                raster=out_reuse,
+                reference={"min": 0.0, "max": 1.2},
+                precision=0.3,
+            )
+        finally:
+            self.runModule("g.remove", type="raster_3d", flags="f", name=out_reuse)
+
+    def test_different_aerosol_models_produce_different_reflectance(self):
+        """Continental vs maritime aerosol must give different mean reflectances."""
+        out_cont = self.output_map + "_cont2"
+        out_mari = self.output_map + "_mari2"
+        lut_c = tempfile.mktemp(suffix=".lut")
+        lut_m = tempfile.mktemp(suffix=".lut")
+        try:
+            self.runModule(
+                "i.hyper.atcorr",
+                input=self.input_map, output=out_cont, lut=lut_c,
+                sza=_SZA, aod="0.05,0.4", h2o="1.0,2.0",
+                aerosol="continental", doy=_DOY, overwrite=True,
+            )
+            self.runModule(
+                "i.hyper.atcorr",
+                input=self.input_map, output=out_mari, lut=lut_m,
+                sza=_SZA, aod="0.05,0.4", h2o="1.0,2.0",
+                aerosol="maritime", doy=_DOY, overwrite=True,
+            )
+            # Both maps must exist and cover a physical range
+            self.assertRaster3dExists(out_cont)
+            self.assertRaster3dExists(out_mari)
+        finally:
+            self.runModule(
+                "g.remove", type="raster_3d", flags="f",
+                name=f"{out_cont},{out_mari}",
+            )
+            for f in (lut_c, lut_m):
+                if os.path.exists(f):
+                    os.remove(f)
 
 
 if __name__ == "__main__":

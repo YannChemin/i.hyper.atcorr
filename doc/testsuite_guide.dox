@@ -1,0 +1,147 @@
+/**
+ * \page page_testsuite Test Suite
+ *
+ * \tableofcontents
+ *
+ * The test suite contains **178 tests** across 6 Python files, all following
+ * the GRASS `grass.gunittest` conventions.  Tests are organised by the
+ * physics component or interface they exercise.  Every test is designed to
+ * be run against the installed library without modification to the source.
+ *
+ * \section ts_summary Test file summary
+ *
+ * | File | Tests | Scope |
+ * |------|------:|-------|
+ * | `testsuite/test_fortran_compat.py` | 32 | Fortran 6SV2.1 ↔ C numerical agreement |
+ * | `testsuite/test_lut.py` | 47 | LUT computation, inversion, spectral/geometry/H₂O behaviour |
+ * | `testsuite/test_solar.py` | 15 | Solar irradiance spectrum and Earth–Sun distance |
+ * | `testsuite/test_retrievals.py` | 47 | H₂O triplet, consensus WVC, OE AOD+H₂O inversion |
+ * | `testsuite/test_spectral_brdf.py` | 20 | MCD43 disaggregation, Tikhonov smoother, DASF |
+ * | `testsuite/test_grass_module.py` | 17 | End-to-end GRASS module, Raster3D I/O |
+ *
+ * \section ts_run How to run
+ *
+ * All tests require an active GRASS session because the Python module
+ * imports `grass.gunittest`.  The simplest way is to use a temporary project:
+ *
+ * \code{.sh}
+ * cd ~/dev/i.hyper.atcorr
+ *
+ * # Run the full suite
+ * grass --tmp-project XY --exec python3 -m pytest testsuite/ -v
+ *
+ * # Run a single file
+ * grass --tmp-project XY --exec python3 testsuite/test_fortran_compat.py
+ *
+ * # Run inside an existing GRASS session (from within GRASS shell)
+ * python3 -m pytest testsuite/ -v
+ * \endcode
+ *
+ * \section ts_fortran test_fortran_compat.py — Fortran 6SV2.1 compatibility (32 tests)
+ *
+ * This file is the primary correctness guarantee for the C port.  It compiles
+ * the Fortran 77 reference code from `~/dev/6sV2.1/` via `gfortran`, runs
+ * the `testsuite/test_6sv_compat.f90` Fortran driver that prints key=value
+ * pairs, then compares those values against the C library output.
+ *
+ * **Prerequisites** — build the Fortran reference objects once:
+ * \code{.sh}
+ * cd ~/dev/6sV2.1
+ * gfortran -O -ffixed-line-length-132 \
+ *     -c CHAND.f ODRAYL.f VARSOL.f SOLIRR.f CSALBR.f GAUSS.f US62.f
+ * \endcode
+ *
+ * The Python test discovers the Fortran `.o` files, links them automatically
+ * using `gfortran`, runs the binary, and cross-checks each output.
+ *
+ * **Test classes and tolerances:**
+ *
+ * | Class / test group | C function | Checks | Tolerance |
+ * |--------------------|-----------|--------|-----------|
+ * | CHAND: 4 geometries | `sixs_chand()` | rtol | 1×10⁻⁵ |
+ * | ODRAYL: 6 wavelengths (VIS/NIR/SWIR) | `sixs_odrayl()` | rtol | 5×10⁻³ |
+ * | ODRAYL: λ⁻⁴ law | monotone τ_blue ≫ τ_SWIR | physics | — |
+ * | VARSOL × d² ≈ 1 | `sixs_earth_sun_dist2()` | rtol | 5×10⁻³ |
+ * | SOLIRR on-grid | `sixs_E0()` | rtol | 1×10⁻³ |
+ * | SOLIRR off-grid | `sixs_E0()` at 0.5512 µm | rtol | 1×10⁻³ |
+ * | CSALBR: 3 τ values | `sixs_csalbr()` | rtol | 1×10⁻⁵ |
+ * | GAUSS n=4, n=8, n=16 | `sixs_gauss()` | nodes, weights, symmetry | 1×10⁻⁵ |
+ *
+ * \section ts_lut test_lut.py — LUT engine (47 tests)
+ *
+ * Exercises LUT computation at representative grid points and the inversion
+ * algebra.  Organised in five test classes:
+ *
+ * - **TestLutCompute** — basic LUT shapes, R_atm positivity, T_down/T_up
+ *   in (0,1], s_alb in [0,1]
+ * - **TestInversion** — Lambertian inversion `atcorr_invert()`, forward–
+ *   inverse round-trip accuracy (< 1 % residual)
+ * - **TestLutSpectralBehavior** — λ-physics: R_atm blue > NIR (Rayleigh
+ *   dominance), T_down NIR > blue, s_alb decreasing with wavelength
+ * - **TestLutGeometrySensitivity** — high SZA reduces T_total, per-pixel
+ *   trilinear interpolation varies continuously with AOD
+ * - **TestLutH2OSensitivity** — higher H₂O suppresses T_down at 940 nm,
+ *   H₂O absorption bands visible at 940/1135 nm
+ *
+ * \section ts_solar test_solar.py — solar spectrum (15 tests)
+ *
+ * - **TestSolarSpectrum** — E0 positive across VIS/NIR/SWIR, finite
+ *   everywhere (0.25–4.0 µm), peak in 0.45–0.60 µm, integral
+ *   700–1400 W/m² over 0.35–2.5 µm, reference values ±15 %
+ * - **TestEarthSunDist** — d² < 1 at perihelion (DOY 3), d² > 1 at
+ *   aphelion (DOY 185), annual range 5.5–8.0 %, perihelion+aphelion ≈ 2
+ *
+ * \section ts_retrievals test_retrievals.py — retrieval algorithms (47 tests)
+ *
+ * - **TestH2OTriplet** — `retrieve_h2o_triplet()`: output shape, physical
+ *   range (0–7 g/cm²), high-absorption gives high WVC, invalid pixels
+ *   flagged, consistency with `retrieve_h2o_940()`
+ * - **TestH2OConsensus** — `retrieve_h2o_consensus()`: agreement when all
+ *   estimates agree, fallback to 2.0 g/cm² when none valid, partial
+ *   validity handled correctly
+ * - **TestOEInvert** — `oe_invert_aod_h2o()`: output shapes, physical
+ *   bounds (AOD > 0, H₂O > 0), prior pull monotonicity (lower prior
+ *   → lower retrieved AOD), different priors give different results
+ *
+ * \section ts_spectral_brdf test_spectral_brdf.py — FlexBRDF + DASF (20 tests)
+ *
+ * - **TestMCD43Disaggregate** — output shape matches target wavelength grid,
+ *   dtype float32, all finite, f_iso ≥ 0, band-centre value within 5 % of
+ *   input weight, NIR plateau jump present (f_iso(860 nm) > f_iso(650 nm)),
+ *   Tikhonov smoothing reduces roughness, single-band query returns length-1
+ * - **TestTikhonovSmoother** — alpha=0 is identity, input not modified,
+ *   output shape matches input, constant signal unchanged, spike damped,
+ *   higher alpha produces flatter output, mean approximately preserved
+ * - **TestDASF** — output shape (npix,) float32, physical range [0.01,1.0]
+ *   for vegetation, zero reflectance → NaN or near-zero, bands outside
+ *   710–790 nm → NaN, brighter NIR → higher DASF
+ *
+ * \section ts_grass test_grass_module.py — GRASS integration (17 tests)
+ *
+ * Runs the full GRASS module inside a temporary XY project, creates synthetic
+ * Raster3D radiance input, and verifies the output cube.
+ *
+ * - Module runs without error (setUpClass asserts exit code 0)
+ * - Output Raster3D exists and has the correct dimensions
+ * - Mid-latitude summer atmosphere accepted without warning
+ * - LUT file reuse between two invocations produces identical output
+ * - Different aerosol models (continental vs. maritime) produce
+ *   statistically different reflectance distributions
+ *
+ * \section ts_philosophy Design philosophy
+ *
+ * Tests follow three principles:
+ *
+ * 1. **Physics-first tolerances** — tolerances are set by the physics
+ *    (float32 precision, known algorithm approximations), not by trial and
+ *    error.  When a test bounds a ratio or integral, the bound is derived
+ *    from a physical argument documented in the test docstring.
+ *
+ * 2. **No mocks for numerical code** — the library functions are called
+ *    directly.  GRASS Raster3D I/O is the only layer that uses a real GRASS
+ *    session; all pure-C tests run without a GRASS database.
+ *
+ * 3. **Fail fast, diagnose clearly** — every `assert*` carries a message
+ *    that prints the actual value so failures are self-explaining without
+ *    running a debugger.
+ */

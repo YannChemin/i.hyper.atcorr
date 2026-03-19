@@ -58,11 +58,13 @@ program test_6sv_compat
   write(*,'(A,F20.12)') 'chand_4=', xrray
 
   ! ── ODRAYL ───────────────────────────────────────────────────────────────────
-  ! Rayleigh optical depth at visible/NIR wavelengths
+  ! Rayleigh optical depth at visible/NIR/SWIR wavelengths
   wl = 0.45 ; call odrayl(wl, tray) ; write(*,'(A,F20.12)') 'odrayl_045=', tray
   wl = 0.55 ; call odrayl(wl, tray) ; write(*,'(A,F20.12)') 'odrayl_055=', tray
   wl = 0.65 ; call odrayl(wl, tray) ; write(*,'(A,F20.12)') 'odrayl_065=', tray
   wl = 0.87 ; call odrayl(wl, tray) ; write(*,'(A,F20.12)') 'odrayl_087=', tray
+  wl = 1.00 ; call odrayl(wl, tray) ; write(*,'(A,F20.12)') 'odrayl_100=', tray
+  wl = 1.50 ; call odrayl(wl, tray) ; write(*,'(A,F20.12)') 'odrayl_150=', tray
 
   ! ── VARSOL ───────────────────────────────────────────────────────────────────
   ! dsol = 1/d²; jday is day-in-month, month 1-12
@@ -114,6 +116,14 @@ program test_6sv_compat
   do i = 1, n
     write(*,'(A,I1,A,F22.15)') 'gauss_x8_', i, '=', x(i)
     write(*,'(A,I1,A,F22.15)') 'gauss_w8_', i, '=', w(i)
+  end do
+
+  ! 16-point Gauss-Legendre quadrature on [-1, 1] (used in DISCOM RT solver)
+  n = 16
+  call gauss(-1.0, 1.0, x, w, n)
+  do i = 1, n
+    write(*,'(A,I0,A,F22.15)') 'gauss_x16_', i, '=', x(i)
+    write(*,'(A,I0,A,F22.15)') 'gauss_w16_', i, '=', w(i)
   end do
 
   stop

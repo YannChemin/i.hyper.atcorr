@@ -24,6 +24,9 @@ Public API
 - :func:`retrieve_quality_mask` — Cloud/shadow/water/snow bitmask.
 - :func:`retrieve_aod_maiac` — Patch-median AOD spatial regularisation.
 - :func:`oe_invert_aod_h2o`  — Joint AOD + H₂O optimal-estimation retrieval.
+- :func:`spectral_smooth_tikhonov` — In-place Tikhonov second-difference smoother.
+- :func:`mcd43_disaggregate` — MCD43 7-band → hyperspectral kernel weight disaggregation.
+- :func:`retrieve_dasf`      — DASF canopy structure factor from 710–790 nm NIR plateau.
 
 Quick-start example::
 
@@ -49,16 +52,21 @@ import os
 import numpy as np
 
 # ── Load shared library ───────────────────────────────────────────────────────
-_here = os.path.dirname(os.path.abspath(__file__))
-_gisbase = os.environ.get("GISBASE", "")
+# The library is now named grass_sixsv (built by lib6sv/) following the GRASS
+# convention.  An unversioned symlink libgrass_sixsv.so is created by Shlib.make
+# alongside the versioned file libgrass_sixsv.<MAJOR>.<MINOR>.so.
+_here      = os.path.dirname(os.path.abspath(__file__))
+_gisbase   = os.environ.get("GISBASE", "")
+_addonbase = os.environ.get("GRASS_ADDON_BASE", "")
 _lib_candidates = [
-    # 1. Installed as a GRASS add-on (preferred)
-    os.path.join(_gisbase, "lib", "libatcorr.so"),
-    # 2. Same directory as this script (installed alongside)
-    os.path.join(_here, "libatcorr.so"),
-    # 3. Build directory (developer build)
-    os.path.join(_here, "..", "build", "libatcorr.so"),
-    os.path.join(_here, "..", "..", "i.hyper.atcorr", "build", "libatcorr.so"),
+    # 1. System / g.extension install under $GISBASE (preferred at runtime)
+    os.path.join(_gisbase,   "lib", "libgrass_sixsv.so"),
+    # 2. Per-user g.extension install under $GRASS_ADDON_BASE
+    os.path.join(_addonbase, "lib", "libgrass_sixsv.so"),
+    # 3. Build tree: lib6sv is a sibling of the directory containing this file
+    #    (dev/lib6sv/python/atcorr.py  →  dev/lib6sv/OBJ.*/libgrass_sixsv.so)
+    *[os.path.join(_here, "..", p, "libgrass_sixsv.so")
+      for p in ("OBJ.x86_64-pc-linux-gnu", "OBJ.x86_64-linux-gnu", "build")],
 ]
 _lib = None
 for _path in _lib_candidates:
@@ -67,7 +75,8 @@ for _path in _lib_candidates:
         break
 if _lib is None:
     raise ImportError(
-        f"libatcorr.so not found. Build with 'make' in i.hyper.atcorr/ first.\n"
+        "libgrass_sixsv.so not found. "
+        "Build lib6sv/ with 'make' first, then 'make install'.\n"
         f"Searched: {_lib_candidates}"
     )
 
@@ -995,3 +1004,177 @@ def oe_invert_aod_h2o(cfg, lut_arrays, rho_toa_vis, vis_wl,
         out_h2o.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
     )
     return out_aod, out_h2o
+
+
+# ── FlexBRDF: Tikhonov smoother + MCD43 disaggregation ───────────────────────
+
+_lib.spectral_smooth_tikhonov.argtypes = [
+    ctypes.POINTER(ctypes.c_float),  # f (in-place)
+    ctypes.c_int,                    # n
+    ctypes.c_float,                  # alpha
+]
+_lib.spectral_smooth_tikhonov.restype = None
+
+_lib.mcd43_disaggregate.argtypes = [
+    ctypes.POINTER(ctypes.c_float),  # fiso_7[7]
+    ctypes.POINTER(ctypes.c_float),  # fvol_7[7]
+    ctypes.POINTER(ctypes.c_float),  # fgeo_7[7]
+    ctypes.POINTER(ctypes.c_float),  # wl_target[n_wl]
+    ctypes.c_int,                    # n_wl
+    ctypes.c_float,                  # alpha
+    ctypes.POINTER(ctypes.c_float),  # fiso_wl[n_wl] (out)
+    ctypes.POINTER(ctypes.c_float),  # fvol_wl[n_wl] (out)
+    ctypes.POINTER(ctypes.c_float),  # fgeo_wl[n_wl] (out)
+]
+_lib.mcd43_disaggregate.restype = None
+
+_lib.retrieve_dasf.argtypes = [
+    ctypes.POINTER(ctypes.c_float),  # refl [n_dasf × npix], band-major
+    ctypes.POINTER(ctypes.c_float),  # wl_dasf [n_dasf]
+    ctypes.c_int,                    # n_dasf
+    ctypes.c_int,                    # npix
+    ctypes.POINTER(ctypes.c_float),  # out_dasf [npix]
+]
+_lib.retrieve_dasf.restype = None
+
+
+def spectral_smooth_tikhonov(f, alpha: float):
+    """Tikhonov second-difference spectral smoother (in-place copy).
+
+    Solves ``(I + α²·D₂ᵀD₂)·x = f`` via O(5n) Cholesky band factorization.
+
+    Parameters
+    ----------
+    f : array-like, shape (n,)
+        Spectral signal to smooth (e.g. disaggregated kernel weights).
+        A copy is made; the original is not modified.
+    alpha : float
+        Regularization strength.  0 = no smoothing; 0.05–0.20 typical for MCD43.
+
+    Returns
+    -------
+    numpy.ndarray, shape (n,), float32
+        Smoothed spectrum.
+    """
+    arr = np.ascontiguousarray(f, dtype=np.float32).copy()
+    n   = len(arr)
+    _lib.spectral_smooth_tikhonov(
+        arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ctypes.c_int(n),
+        ctypes.c_float(float(alpha)),
+    )
+    return arr
+
+
+def mcd43_disaggregate(fiso_7, fvol_7, fgeo_7, wl_target, alpha: float = 0.10):
+    """Disaggregate 7-band MCD43 kernel weights to a hyperspectral wavelength grid.
+
+    Piecewise-linear interpolation between the 7 MODIS MCD43 band centres
+    ({0.469, 0.555, 0.645, 0.858, 1.240, 1.640, 2.130} µm) followed by
+    optional Tikhonov second-difference spectral smoothing.
+
+    Parameters
+    ----------
+    fiso_7 : array-like, shape (7,)
+        f_iso kernel weights at MODIS band centres (scale factor 0.001 applied).
+    fvol_7 : array-like, shape (7,)
+        f_vol kernel weights.
+    fgeo_7 : array-like, shape (7,)
+        f_geo kernel weights.
+    wl_target : array-like, shape (n_wl,)
+        Target wavelengths in µm (e.g. sensor centre wavelengths).
+    alpha : float, optional
+        Tikhonov regularization strength (default 0.10; 0 = off).
+
+    Returns
+    -------
+    fiso_wl, fvol_wl, fgeo_wl : numpy.ndarray, shape (n_wl,), float32
+        Disaggregated kernel weight spectra at each target wavelength.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from atcorr import mcd43_disaggregate
+    >>> wl = np.linspace(0.40, 2.50, 421, dtype=np.float32)
+    >>> fiso_7 = [0.112, 0.117, 0.095, 0.243, 0.155, 0.118, 0.085]
+    >>> fvol_7 = [0.045, 0.040, 0.038, 0.131, 0.038, 0.022, 0.014]
+    >>> fgeo_7 = [0.017, 0.014, 0.012, 0.052, 0.016, 0.009, 0.006]
+    >>> fiso, fvol, fgeo = mcd43_disaggregate(fiso_7, fvol_7, fgeo_7, wl, alpha=0.10)
+    >>> fiso.shape
+    (421,)
+    """
+    fi7 = np.ascontiguousarray(fiso_7, dtype=np.float32)
+    fv7 = np.ascontiguousarray(fvol_7, dtype=np.float32)
+    fg7 = np.ascontiguousarray(fgeo_7, dtype=np.float32)
+    wl  = np.ascontiguousarray(wl_target, dtype=np.float32)
+    n_wl = len(wl)
+
+    fiso_wl = np.empty(n_wl, dtype=np.float32)
+    fvol_wl = np.empty(n_wl, dtype=np.float32)
+    fgeo_wl = np.empty(n_wl, dtype=np.float32)
+
+    _lib.mcd43_disaggregate(
+        fi7.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        fv7.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        fg7.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        wl.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ctypes.c_int(n_wl),
+        ctypes.c_float(float(alpha)),
+        fiso_wl.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        fvol_wl.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        fgeo_wl.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return fiso_wl, fvol_wl, fgeo_wl
+
+
+def retrieve_dasf(refl, wl_dasf):
+    """Per-pixel DASF from corrected BRF in the 710–790 nm NIR plateau.
+
+    Directional Area Scattering Factor (Knyazikhin et al. 2013 PNAS):
+    ρ(λ) ≈ DASF × ω_L(λ)  →  DASF = Σ[ρ·ω_L] / Σ[ω_L²]
+
+    Leaf albedo ω_L(λ) is taken from the internal PROSPECT-D table
+    (Féret et al. 2017, Cab=40 µg/cm²) at 5 nm steps 705–795 nm.
+    Bands outside this range (leaf_albedo_nir returns -1) are skipped.
+
+    Parameters
+    ----------
+    refl : array-like, shape (n_dasf, npix) or (npix, n_dasf)
+        BOA reflectance at bands within 710–790 nm, **band-major** order:
+        refl[b, i] = band b of pixel i.  Use ``refl.T`` if your array is
+        pixel-major.
+    wl_dasf : array-like, shape (n_dasf,)
+        Wavelengths of the supplied bands [µm].
+
+    Returns
+    -------
+    dasf : float32 array, shape (npix,)
+        DASF per pixel ∈ [0.01, 1.0]; NaN if fewer than 3 valid bands
+        or NDVI < threshold (NDVI masking is applied in the GRASS module
+        only; the standalone function returns NaN only for bad numerics).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from atcorr import retrieve_dasf
+    >>> # 5 bands at 710-790 nm, 1000 pixels
+    >>> wl = np.array([0.710, 0.730, 0.750, 0.770, 0.790], dtype=np.float32)
+    >>> refl = np.full((5, 1000), 0.45, dtype=np.float32)
+    >>> dasf = retrieve_dasf(refl, wl)
+    >>> 0.01 <= float(np.nanmean(dasf)) <= 1.0
+    True
+    """
+    refl_c  = np.ascontiguousarray(refl,    dtype=np.float32)
+    wl_c    = np.ascontiguousarray(wl_dasf, dtype=np.float32)
+    n_dasf  = refl_c.shape[0]
+    npix    = refl_c.shape[1]
+    out     = np.empty(npix, dtype=np.float32)
+
+    _lib.retrieve_dasf(
+        refl_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        wl_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ctypes.c_int(n_dasf),
+        ctypes.c_int(npix),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return out

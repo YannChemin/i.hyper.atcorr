@@ -399,5 +399,204 @@ class TestAODDDV(TestCase):
         self.assertEqual(len(aod_px), n)
 
 
+class TestH2OTriplet(TestCase):
+    """Tests for retrieve_h2o_triplet(): generalised band-depth H₂O retrieval."""
+
+    # 940 nm triplet: 865 nm (lo), 940 nm (feat), 1040 nm (hi)
+    # K_ref = 0.036 cm²/g  (MODIS broadband)  fwhm_ref = 0.050 µm (50 nm)
+    _WL_LO   = 0.865
+    _WL_FEAT = 0.940
+    _WL_HI   = 1.040
+    _K_REF   = 0.036
+    _FWHM_REF = 0.050
+
+    def _triplet(self, L_feat_val, n=_NPIX):
+        return ac.retrieve_h2o_triplet(
+            _uniform(100.0, n), _uniform(L_feat_val, n), _uniform(100.0, n),
+            wl_lo_um=self._WL_LO, wl_feat_um=self._WL_FEAT, wl_hi_um=self._WL_HI,
+            K_ref=self._K_REF, fwhm_ref_um=self._FWHM_REF,
+            sza_deg=_SZA30, vza_deg=_VZA0,
+        )
+
+    def test_output_shapes(self):
+        """retrieve_h2o_triplet must return wvc [npix] and valid [npix]."""
+        wvc, valid = self._triplet(80.0)
+        self.assertEqual(len(wvc),   _NPIX)
+        self.assertEqual(len(valid), _NPIX)
+        self.assertEqual(wvc.dtype,   np.float32)
+        self.assertEqual(valid.dtype, np.uint8)
+
+    def test_moderate_absorption_valid(self):
+        """D=0.2 must produce valid pixels (flag=1) and WVC > 0.1 g/cm²."""
+        wvc, valid = self._triplet(80.0)  # L_feat=80 → D=0.2
+        self.assertTrue(np.any(valid == 1), msg="No valid pixels for D=0.2")
+        valid_wvc = wvc[valid == 1]
+        self.assertTrue(np.all(valid_wvc > 0.1),
+                        msg=f"Valid WVC below 0.1 g/cm²: min={valid_wvc.min():.3f}")
+
+    def test_no_absorption_gives_invalid_or_low_wvc(self):
+        """D≈0 (L_feat = L_cont) must mark all pixels invalid or return fallback WVC.
+
+        The function marks pixels with D < D_min as invalid (valid=0) and returns
+        the fallback WVC (≈2.0 g/cm²).  Accept either valid=0 or a small WVC.
+        """
+        wvc, valid = self._triplet(100.0)
+        if np.any(valid == 1):
+            # If some pixels are marked valid despite D≈0, their WVC must be low
+            self.assertTrue(np.all(wvc[valid == 1] <= 2.5),
+                            msg=f"WVC={wvc[valid==1].max():.2f} too high for zero absorption")
+        else:
+            # All pixels invalid → fallback value is acceptable
+            self.assertTrue(np.all(wvc <= 3.0),
+                            msg=f"Fallback WVC={wvc.max():.2f} unexpectedly large")
+
+    def test_output_clamped_in_range(self):
+        """WVC output must be clamped to [0.1, 8.0] g/cm²."""
+        wvc, _ = self._triplet(0.001)   # near-total absorption
+        self.assertTrue(np.all(wvc <= 8.0 + 0.01))
+        self.assertTrue(np.all(wvc >= 0.0))
+
+    def test_consistent_with_h2o_940_at_same_depth(self):
+        """Triplet retrieval at 940nm must agree with retrieve_h2o_940 within 20%."""
+        L_feat = 80.0   # D = 0.2
+        wvc_triplet, _ = self._triplet(L_feat)
+        wvc_940 = ac.retrieve_h2o_940(
+            _uniform(100.0), _uniform(L_feat), _uniform(100.0),
+            sza_deg=_SZA30, vza_deg=_VZA0,
+        )
+        np.testing.assert_allclose(
+            float(wvc_triplet.mean()), float(wvc_940.mean()),
+            rtol=0.20,
+            err_msg=f"Triplet WVC={wvc_triplet.mean():.2f} vs H2O-940 WVC={wvc_940.mean():.2f}",
+        )
+
+
+class TestH2OConsensus(TestCase):
+    """Tests for retrieve_h2o_consensus(): per-pixel median across retrievals."""
+
+    def _make_wvc(self, val, n=_NPIX):
+        return np.full(n, val, dtype=np.float32)
+
+    def _make_valid(self, val=1, n=_NPIX):
+        return np.full(n, val, dtype=np.uint8)
+
+    def test_output_shape(self):
+        """Output must be float32 array of length npix."""
+        wvc1 = self._make_wvc(2.0)
+        wvc2 = self._make_wvc(2.5)
+        out, _ = ac.retrieve_h2o_consensus(
+            [wvc1, wvc2], [self._make_valid(), self._make_valid()], _NPIX
+        )
+        self.assertEqual(len(out), _NPIX)
+        self.assertEqual(out.dtype, np.float32)
+
+    def test_two_agreeing_methods_return_mean(self):
+        """Two estimates of 2.0 and 2.4 g/cm² must give consensus ≈ 2.2 g/cm²."""
+        wvc1 = self._make_wvc(2.0)
+        wvc2 = self._make_wvc(2.4)
+        out, n_agreed = ac.retrieve_h2o_consensus(
+            [wvc1, wvc2], [self._make_valid(), self._make_valid()], _NPIX
+        )
+        np.testing.assert_allclose(float(out.mean()), 2.2, atol=0.2)
+        self.assertGreater(n_agreed, 0)
+
+    def test_single_valid_method_used(self):
+        """When only one method is valid, its value must be returned."""
+        wvc1 = self._make_wvc(3.0)
+        wvc2 = self._make_wvc(1.0)
+        valid1 = self._make_valid(1)
+        valid2 = self._make_valid(0)   # all invalid
+        out, _ = ac.retrieve_h2o_consensus(
+            [wvc1, wvc2], [valid1, valid2], _NPIX
+        )
+        np.testing.assert_allclose(float(out.mean()), 3.0, rtol=0.05)
+
+    def test_all_invalid_returns_fallback(self):
+        """All-invalid pixels must return a fallback value (not NaN or negative)."""
+        wvc1 = self._make_wvc(2.0)
+        wvc2 = self._make_wvc(2.0)
+        valid0 = self._make_valid(0)
+        out, _ = ac.retrieve_h2o_consensus(
+            [wvc1, wvc2], [valid0, valid0], _NPIX
+        )
+        self.assertTrue(np.all(np.isfinite(out)), msg="Consensus returned NaN/Inf")
+        self.assertTrue(np.all(out > 0.0),        msg="Consensus returned non-positive")
+
+
+class TestOEInvert(TestCase):
+    """Tests for oe_invert_aod_h2o(): joint MAP retrieval of AOD and H₂O."""
+
+    # Small LUT for OE tests
+    _WL_VIS = np.array([0.45, 0.55, 0.65], dtype=np.float32)
+    _AOD    = np.array([0.0, 0.2, 0.6, 1.0], dtype=np.float32)
+    _H2O    = np.array([0.5, 1.5, 3.0],      dtype=np.float32)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cfg = ac.LutConfig(
+            wl=cls._WL_VIS, aod=cls._AOD, h2o=cls._H2O,
+            sza=30.0, vza=5.0, raa=90.0, altitude_km=1000.0,
+            atmo_model=1, aerosol_model=1, ozone_du=300.0,
+        )
+        cls.lut = ac.compute_lut(cls.cfg)
+
+    def _run_oe(self, rho_toa_vis, aod_prior=0.15, h2o_prior=2.0, **kw):
+        return ac.oe_invert_aod_h2o(
+            self.cfg, self.lut, rho_toa_vis, self._WL_VIS,
+            sza_deg=30.0, vza_deg=5.0,
+            aod_prior=aod_prior, h2o_prior=h2o_prior,
+            sigma_aod=0.5, sigma_h2o=1.0, sigma_spec=0.01,
+            **kw,
+        )
+
+    def test_output_shapes(self):
+        """oe_invert_aod_h2o must return (aod, h2o) arrays of shape (npix,)."""
+        npix = 10
+        rho = np.full((npix, len(self._WL_VIS)), 0.08, dtype=np.float32)
+        aod_px, h2o_px = self._run_oe(rho)
+        self.assertEqual(aod_px.shape, (npix,))
+        self.assertEqual(h2o_px.shape, (npix,))
+
+    def test_output_physically_bounded(self):
+        """Retrieved AOD must be in [0, 2] and H₂O in [0.1, 8] for realistic input."""
+        npix = 20
+        rho = np.full((npix, len(self._WL_VIS)), 0.08, dtype=np.float32)
+        aod_px, h2o_px = self._run_oe(rho)
+        self.assertTrue(np.all(aod_px >= 0.0),  msg=f"AOD < 0: {aod_px.min():.3f}")
+        self.assertTrue(np.all(aod_px <= 2.0),  msg=f"AOD > 2: {aod_px.max():.3f}")
+        self.assertTrue(np.all(h2o_px >= 0.0),  msg=f"H2O < 0: {h2o_px.min():.3f}")
+        self.assertTrue(np.all(h2o_px <= 8.0),  msg=f"H2O > 8: {h2o_px.max():.3f}")
+        self.assertTrue(np.all(np.isfinite(aod_px)), msg="Non-finite AOD")
+        self.assertTrue(np.all(np.isfinite(h2o_px)), msg="Non-finite H2O")
+
+    def test_prior_pull_shifts_result(self):
+        """Retrieved AOD at prior=0.05 must be ≤ retrieval at prior=0.60 (all else equal)."""
+        npix = 10
+        rho = np.full((npix, len(self._WL_VIS)), 0.08, dtype=np.float32)
+        aod_lo, _ = self._run_oe(rho, aod_prior=0.05)
+        aod_mid, _ = self._run_oe(rho, aod_prior=0.30)
+        aod_hi, _ = self._run_oe(rho, aod_prior=0.60)
+        self.assertLessEqual(
+            float(aod_lo.mean()), float(aod_hi.mean()) + 1e-4,
+            msg=(f"Prior pull not monotone: AOD(prior=0.05)={float(aod_lo.mean()):.3f} "
+                 f"> AOD(prior=0.60)={float(aod_hi.mean()):.3f}"),
+        )
+        # Middle prior must be between the two extremes (or equal)
+        lo, hi = sorted([float(aod_lo.mean()), float(aod_hi.mean())])
+        self.assertGreaterEqual(float(aod_mid.mean()), lo - 1e-4)
+        self.assertLessEqual(   float(aod_mid.mean()), hi + 1e-4)
+
+    def test_different_priors_give_different_results(self):
+        """Changing the AOD prior (with loose sigma) must shift the mean retrieved AOD."""
+        npix = 10
+        rho = np.full((npix, len(self._WL_VIS)), 0.08, dtype=np.float32)
+        aod_lo, _ = self._run_oe(rho, aod_prior=0.05)
+        aod_hi, _ = self._run_oe(rho, aod_prior=0.80)
+        self.assertLess(
+            float(aod_lo.mean()), float(aod_hi.mean()),
+            msg="Higher AOD prior must give higher (or equal) retrieved AOD",
+        )
+
+
 if __name__ == "__main__":
     test()

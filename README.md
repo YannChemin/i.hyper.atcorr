@@ -237,13 +237,23 @@ cd i.hyper.atcorr
 make
 ```
 
-Output: `$GRASS_DIST/bin/i.hyper.atcorr` and `$GRASS_DIST/lib/libatcorr.so`
+Output: `$GRASS_DIST/bin/i.hyper.atcorr`
+
+The RT physics library (`libgrass_sixsv.so`) is built separately from the
+`libsixsv` sibling repository and must be installed first:
+
+```sh
+# Build and install libgrass_sixsv.so (hardcodes -fopenmp -lgomp)
+cd ~/dev/libsixsv
+make MODULE_TOPDIR=$HOME/dev/grass
+sudo make install MODULE_TOPDIR=$HOME/dev/grass
+```
 
 ### Install to system GRASS
 
 ```sh
-sudo cp dist.*/bin/i.hyper.atcorr /usr/local/grass85/bin/
-sudo cp dist.*/lib/libatcorr.so   /usr/local/grass85/lib/
+sudo cp dist.*/bin/i.hyper.atcorr        /usr/local/grass85/bin/
+sudo cp dist.*/lib/libgrass_sixsv.8.6.so /usr/local/grass85/lib/
 ```
 
 ---
@@ -430,38 +440,45 @@ per-pixel arrays used during the correction step.
 
 ## Architecture
 
+The RT physics live in the **`libsixsv`** sibling repository
+(`~/dev/libsixsv`), compiled into `libgrass_sixsv.so`.  This add-on repo
+contains only the GRASS module interface (`main.c`) and the Python bindings.
+
 ```
-src/
-├── lut.c            OpenMP LUT computation (AOD outer loop)
-│                    + atcorr_lut_interp_pixel() trilinear interp
-├── discom.c         6SV scattering at 20 reference wavelengths (SOS)
-├── interp.c         Log-log wavelength interpolation
-├── gas_abs.c        Curtis-Godson gas transmittance
-├── aerosol.c        Aerosol mixture initialisation
-├── atmosphere.c     Standard atmosphere models
-├── srf_conv.c       SRF gas correction via libRadtran reptran fine
-├── spatial.c        Separable Gaussian + box filters          [#1]
-├── adjacency.c      Vermote 1997 adjacency correction         [#2]
-├── surface_model.c  3-component surface prior + MAP           [#3,#5,#6]
-├── uncertainty.c    Noise + AOD-perturbation uncertainty      [#4]
-├── spectral_brdf.c  MCD43 disaggregation + Tikhonov smoother [FlexBRDF]
-├── retrieve.c       Image-based retrieval (H2O/AOD/O3/DASF)
-└── rt.c / scatra.c / ... (6SV RT solver, ported from Fortran)
+~/dev/libsixsv/                              (sibling repo)
+├── src/
+│   ├── lut.c            OpenMP LUT computation (AOD outer loop)
+│   │                    + atcorr_lut_interp_pixel() trilinear interp
+│   ├── discom.c         6SV scattering at 20 reference wavelengths (SOS)
+│   ├── interp.c         Log-log wavelength interpolation
+│   ├── gas_abs.c        Curtis-Godson gas transmittance
+│   ├── aerosol.c        Aerosol mixture initialisation
+│   ├── atmosphere.c     Standard atmosphere models
+│   ├── srf_conv.c       SRF gas correction via libRadtran reptran fine
+│   ├── spatial.c        Separable Gaussian + box filters          [#1]
+│   ├── adjacency.c      Vermote 1997 adjacency correction         [#2]
+│   ├── surface_model.c  3-component surface prior + MAP           [#3,#5,#6]
+│   ├── uncertainty.c    Noise + AOD-perturbation uncertainty      [#4]
+│   ├── spectral_brdf.c  MCD43 disaggregation + Tikhonov smoother [FlexBRDF]
+│   ├── retrieve.c       Image-based retrieval (H2O/AOD/O3/DASF)
+│   └── rt.c / scatra.c / ... (6SV RT solver, ported from Fortran)
+├── include/
+│   ├── atcorr.h         Public API (LutConfig, LutArrays, all exports)
+│   ├── spatial.h        [#1]
+│   ├── adjacency.h      [#2]
+│   ├── surface_model.h  [#3,#5,#6]
+│   ├── uncertainty.h    [#4]
+│   ├── spectral_brdf.h  FlexBRDF (mcd43_disaggregate, spectral_smooth_tikhonov)
+│   └── retrieve.h       Retrieval API (H2O, AOD, O3, DASF)
+└── Makefile             builds libgrass_sixsv.so; hardcodes -fopenmp -lgomp
+                         (GRASS Platform.make sets OPENMP_LIB= empty unless
+                         GRASS itself was configured with --with-openmp)
 
-include/
-├── atcorr.h         Public API (LutConfig, LutArrays, all exports)
-├── spatial.h        [#1]
-├── adjacency.h      [#2]
-├── surface_model.h  [#3,#5,#6]
-├── uncertainty.h    [#4]
-├── spectral_brdf.h  FlexBRDF (mcd43_disaggregate, spectral_smooth_tikhonov)
-└── retrieve.h       Retrieval API (H2O, AOD, O3, DASF)
-
-main.c               GRASS module interface, correct_raster3d()
-
-python/
-└── atcorr.py        ctypes bindings (LutConfig, compute_lut, lut_slice,
-                     atcorr_lut_interp_pixel, apply_srf_correction)
+~/dev/i.hyper.atcorr/                       (this repo)
+├── main.c               GRASS module interface, correct_raster3d()
+└── python/
+    └── atcorr.py        ctypes bindings (LutConfig, compute_lut, lut_slice,
+                         atcorr_lut_interp_pixel, apply_srf_correction)
 ```
 
 ---
@@ -492,7 +509,7 @@ Typical size: ~4 MB for 6 AOD × 5 H₂O × 211 wavelengths.
 
 ## Python bindings
 
-`libatcorr.so` is importable from Python via ctypes (`python/atcorr.py`):
+`libgrass_sixsv.so` is importable from Python via ctypes (`python/atcorr.py`):
 
 ```python
 from atcorr import LutConfig, compute_lut, lut_slice, apply_srf_correction
@@ -503,23 +520,151 @@ Rs, Tds, Tus, ss = lut_slice(cfg, lut, aod_val=0.18, h2o_val=3.5)
 lut = apply_srf_correction(cfg, lut, fwhm_um=band_fwhm, threshold_nm=5.0)
 ```
 
+### FlexBRDF from Python
+
+```python
+import numpy as np
+from atcorr import mcd43_disaggregate, spectral_smooth_tikhonov
+
+# Sensor wavelengths (e.g. EnMAP, 420 bands 0.40–2.45 µm)
+wl = np.linspace(0.40, 2.45, 420, dtype=np.float32)
+
+# MCD43A1 kernel weights (scale factor 0.001 already applied)
+fiso_7 = [0.112, 0.117, 0.095, 0.243, 0.155, 0.118, 0.085]
+fvol_7 = [0.045, 0.040, 0.038, 0.131, 0.038, 0.022, 0.014]
+fgeo_7 = [0.017, 0.014, 0.012, 0.052, 0.016, 0.009, 0.006]
+
+# Disaggregate to sensor grid with Tikhonov smoothing (alpha=0.10)
+fiso_wl, fvol_wl, fgeo_wl = mcd43_disaggregate(
+    fiso_7, fvol_7, fgeo_7, wl, alpha=0.10
+)
+# fiso_wl, fvol_wl, fgeo_wl are float32 arrays of shape (420,)
+
+# Apply spectral smoothing to any signal independently
+from atcorr import spectral_smooth_tikhonov
+smoothed = spectral_smooth_tikhonov(some_spectrum, alpha=0.05)
+```
+
+### DASF from Python
+
+```python
+import numpy as np
+from atcorr import retrieve_dasf
+
+# Suppose `refl_cube` is [n_bands, npix] BOA reflectance from the GRASS module
+# Select the 710-790 nm bands from the full cube:
+nir_mask  = (wl >= 0.710) & (wl <= 0.790)
+wl_nir    = wl[nir_mask]                   # e.g. 17 bands for 5 nm step sensor
+refl_nir  = refl_cube[nir_mask, :]         # shape (17, npix)
+
+dasf = retrieve_dasf(refl_nir, wl_nir)    # float32 [npix]; NaN for bad pixels
+
+# Leaf albedo decomposition: recover effective leaf spectrum
+# (vectorised for all pixels at once)
+from atcorr import mcd43_disaggregate
+# (use the same wl_nir grid for leaf_albedo_nir — internal PROSPECT-D table)
+# For visualization, compute pixel-mean DASF and divide into mean reflectance:
+valid = np.isfinite(dasf) & (dasf > 0.05)
+mean_dasf   = float(np.nanmean(dasf[valid]))
+leaf_albedo = refl_cube[:, valid].mean(axis=1) / mean_dasf
+```
+
 ---
 
-## Validation — Fortran 6SV2.1 compatibility
+## C API
 
-`testsuite/test_fortran_compat.py` (25 tests) cross-checks every C function
-in `libatcorr.so` against the original Fortran 77 subroutines compiled from
-`~/dev/6SV2.1/`.  All 25 tests pass with no C code bugs found.
+`libgrass_sixsv.so` can be linked directly from C or C++.  Include the
+relevant header from `~/dev/libsixsv/include/` and link with `-lgrass_sixsv`.
+
+### FlexBRDF from C
+
+```c
+#include "libsixsv/include/spectral_brdf.h"
+#include <stdlib.h>
+
+/* Sensor wavelength grid (n_wl bands) */
+int n_wl = 420;
+float *wl = ...;   /* µm, 0.40–2.45 */
+
+/* MCD43A1 kernel weights (7 bands, scale factor 0.001 applied) */
+float fiso_7[7] = {0.112f, 0.117f, 0.095f, 0.243f, 0.155f, 0.118f, 0.085f};
+float fvol_7[7] = {0.045f, 0.040f, 0.038f, 0.131f, 0.038f, 0.022f, 0.014f};
+float fgeo_7[7] = {0.017f, 0.014f, 0.012f, 0.052f, 0.016f, 0.009f, 0.006f};
+
+float *fiso_wl = malloc(n_wl * sizeof(float));
+float *fvol_wl = malloc(n_wl * sizeof(float));
+float *fgeo_wl = malloc(n_wl * sizeof(float));
+
+/* Disaggregate with Tikhonov smoothing (alpha=0.10) */
+mcd43_disaggregate(fiso_7, fvol_7, fgeo_7,
+                   wl, n_wl, 0.10f,
+                   fiso_wl, fvol_wl, fgeo_wl);
+
+/* Optional: smooth any other spectrum independently */
+spectral_smooth_tikhonov(some_spectrum, n_wl, 0.05f);  /* in-place */
+
+/* NBAR ratio at band z:
+ *   scale_iso = fiso_wl[z] / fiso_wl[i858]
+ *   f_obs_wl  = (fiso_px + fvol_px * K_RT + fgeo_px * K_LS)
+ *               × scale_iso / scale_iso_obs ... (see brdf.c)
+ */
+free(fiso_wl); free(fvol_wl); free(fgeo_wl);
+```
+
+### DASF from C
+
+```c
+#include "libsixsv/include/retrieve.h"
+#include <math.h>
+
+/* After atmospheric correction, select the 710-790 nm bands */
+/* refl[b * npix + i] = band b of pixel i (band-major layout)  */
+int n_dasf = 17;   /* bands within 710-790 nm */
+int npix   = nrows * ncols;
+float *refl_nir  = ...;   /* [n_dasf × npix], band-major          */
+float *wl_nir    = ...;   /* n_dasf wavelengths [µm] in 710-790   */
+float *dasf      = malloc(npix * sizeof(float));
+
+retrieve_dasf(refl_nir, wl_nir, n_dasf, npix, dasf);
+
+/* dasf[i] ∈ [0.01, 1.0], NaN for non-vegetation / bad pixels */
+for (int i = 0; i < npix; i++) {
+    if (!isnan(dasf[i]))
+        /* ... process vegetation pixel ... */;
+}
+free(dasf);
+```
+
+---
+
+## Validation
+
+The test suite contains **178 tests** across 6 files, all passing:
+
+| File | Tests | Scope |
+|------|-------|-------|
+| `testsuite/test_fortran_compat.py` | 32 | Fortran 6SV2.1 ↔ C function agreement |
+| `testsuite/test_lut.py` | 47 | LUT generation, inversion, spectral/geometry/H₂O behaviour |
+| `testsuite/test_solar.py` | 15 | Solar irradiance spectrum + Earth-Sun distance |
+| `testsuite/test_retrievals.py` | 47 | H₂O triplet, consensus, OE inversion |
+| `testsuite/test_spectral_brdf.py` | 20 | FlexBRDF (MCD43), Tikhonov smoother, DASF |
+| `testsuite/test_grass_module.py` | 17 | End-to-end GRASS module integration |
+
+### Fortran 6SV2.1 compatibility (`test_fortran_compat.py`, 32 tests)
+
+Cross-checks every C function in `libgrass_sixsv.so` against the original
+Fortran 77 subroutines compiled from `~/dev/6sV2.1/`.
 
 | Subroutine | Function tested | Tests | Tolerance | Actual agreement |
 |---|---|---|---|---|
 | CHAND | `sixs_chand()` – Chandrasekhar Rayleigh reflectance | 4 geometries | rtol=1×10⁻⁵ | ~7×10⁻⁸ (float32 limit) |
-| ODRAYL | `sixs_odrayl()` – Rayleigh optical depth (Edlén 1966) | 4 wavelengths | rtol=5×10⁻³ | ~2×10⁻⁷ |
+| ODRAYL | `sixs_odrayl()` – Rayleigh optical depth (Edlén 1966) | 6 wavelengths (VIS/NIR/SWIR) | rtol=5×10⁻³ | ~2×10⁻⁷ |
+| ODRAYL monotone | λ⁻⁴ spectral law: τ_blue >> τ_NIR >> τ_SWIR | 2 ratio checks | physics | confirmed |
 | VARSOL × d² ≈ 1 | `sixs_earth_sun_dist2()` – Earth-Sun distance | 4 DOYs | rtol=5×10⁻³ | <0.07% |
 | SOLIRR / E0 on-grid | `sixs_E0()` – Thuillier solar irradiance | 4 wavelengths | rtol=1×10⁻³ | 0–3 ULP |
 | SOLIRR / E0 off-grid | `sixs_E0()` – linear vs nearest-neighbour interp | 1 wavelength | rtol=1×10⁻³ | 0.035% |
 | CSALBR | `sixs_csalbr()` – Rayleigh spherical albedo | 3 τ values | rtol=1×10⁻⁵ | ~9×10⁻⁸ (float32 limit) |
-| GAUSS | `sixs_gauss()` – Gauss-Legendre quadrature | n=4 and n=8, weight sums, symmetry | rtol=1×10⁻⁵ | Exact float32 |
+| GAUSS | `sixs_gauss()` – Gauss-Legendre quadrature | n=4, n=8, n=16; weight sums, symmetry, nodes | rtol=1×10⁻⁵ | Exact float32 |
 
 Minor intentional differences:
 - `sixs_E0()` uses linear interpolation for off-grid wavelengths; Fortran SOLIRR uses nearest-neighbour — both agree to 0.035% (smooth solar spectrum).
@@ -533,13 +678,20 @@ Minor intentional differences:
 cd ~/dev/6sV2.1
 gfortran -O -ffixed-line-length-132 -c CHAND.f ODRAYL.f VARSOL.f SOLIRR.f CSALBR.f GAUSS.f US62.f
 
-# Run all 25 compatibility tests
+# Run all 32 Fortran compatibility tests
 cd ~/dev/i.hyper.atcorr
 grass --tmp-project XY --exec python3 testsuite/test_fortran_compat.py
 ```
 
-The test driver (`testsuite/test_6sv_compat.f90`) is compiled automatically
+The Fortran driver (`testsuite/test_6sv_compat.f90`) is compiled automatically
 by the Python test suite when the Fortran objects are present.
+
+### Run full test suite
+
+```sh
+cd ~/dev/i.hyper.atcorr
+grass --tmp-project XY --exec python3 -m pytest testsuite/ -v
+```
 
 ---
 

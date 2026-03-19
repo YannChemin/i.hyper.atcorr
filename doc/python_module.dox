@@ -1,0 +1,257 @@
+/**
+ * \page page_python_module Using i.hyper.atcorr as a Python module within GRASS
+ *
+ * \tableofcontents
+ *
+ * \section pm_intro Overview
+ *
+ * Beyond running as a GRASS command-line module, i.hyper.atcorr can be
+ * driven entirely from Python within a GRASS session.  This is useful for:
+ *
+ * - Scripting batch corrections over many scenes
+ * - Integrating atmospheric correction into a larger GRASS Python workflow
+ * - Prototyping custom retrieval pipelines in a Jupyter notebook while still
+ *   using GRASS Raster3D data structures
+ * - Running the library functions without the GRASS module interface at all
+ *   (see \ref pm_no_grass)
+ *
+ * \section pm_session Starting a GRASS session from Python
+ *
+ * \code{.py}
+ * import subprocess, os, sys
+ *
+ * # Option A: launch a temporary project and run a Python script inside it
+ * subprocess.run([
+ *     "grass", "--tmp-project", "EPSG:32636",
+ *     "--exec", "python3", "my_correction_script.py"
+ * ], check=True)
+ *
+ * # Option B: set up the GRASS environment manually (for Jupyter)
+ * gisbase = subprocess.check_output(["grass", "--config", "path"],
+ *                                   text=True).strip()
+ * sys.path.insert(0, os.path.join(gisbase, "etc", "python"))
+ * os.environ["GISBASE"] = gisbase
+ * import grass.script as gs
+ * import grass.script.setup as gsetup
+ * gsetup.init(gisbase, gisdbase="/tmp/grassdb", location="myproject",
+ *             mapset="PERMANENT")
+ * \endcode
+ *
+ * \section pm_run_module Running i.hyper.atcorr from Python
+ *
+ * Once inside a GRASS session, the module is called via `grass.script`:
+ *
+ * \code{.py}
+ * import grass.script as gs
+ *
+ * # Generate LUT + correct a radiance cube in one call
+ * gs.run_command(
+ *     "i.hyper.atcorr",
+ *     input="tanager_radiance",
+ *     output="tanager_refl",
+ *     lut="tanager_2026.lut",
+ *     sza=35.2, vza=4.1, raa=97, doy=160,
+ *     atmosphere="midsum",
+ *     aerosol="continental",
+ *     aod="0.0,0.05,0.1,0.2,0.4,0.8",
+ *     h2o="0.5,1.5,3.0,5.0",
+ *     wl_min=0.376, wl_max=2.499, wl_step=0.005,
+ *     aod_val=0.15, h2o_val=2.0,
+ * )
+ * \endcode
+ *
+ * Image-based retrieval flags are passed as `flags=`:
+ *
+ * \code{.py}
+ * # Retrieve O3 (-z), per-pixel H2O (-w), per-pixel AOD (-a)
+ * gs.run_command(
+ *     "i.hyper.atcorr",
+ *     flags="zwa",
+ *     input="emit_radiance",
+ *     output="emit_refl",
+ *     lut="emit_auto.lut",
+ *     sza=38, vza=2, raa=110, doy=200,
+ *     atmosphere="midsum",
+ *     aerosol="continental",
+ *     aod="0.0,0.05,0.1,0.2,0.4,0.8",
+ *     h2o="0.5,1.5,3.0,5.0",
+ *     wl_min=0.376, wl_max=2.499, wl_step=0.005,
+ *     dem="srtm_dem",
+ * )
+ * \endcode
+ *
+ * \section pm_read_output Reading the output Raster3D from Python
+ *
+ * After correction, the BOA reflectance cube is a GRASS Raster3D map.
+ * The easiest way to read it back into a NumPy array is via `grass.pygrass`:
+ *
+ * \code{.py}
+ * import numpy as np
+ * from grass.pygrass.raster3d import RasterSegment3d
+ * import grass.script as gs
+ *
+ * def read_raster3d(name):
+ *     """Read a GRASS Raster3D map into a float32 NumPy array [nz, ny, nx]."""
+ *     info = gs.raster3d_info(name)
+ *     nz   = info["depths"]
+ *     ny   = info["rows"]
+ *     nx   = info["cols"]
+ *     cube = np.empty((nz, ny, nx), dtype=np.float32)
+ *
+ *     r3 = RasterSegment3d(name)
+ *     r3.open("r")
+ *     for k in range(nz):
+ *         for j in range(ny):
+ *             row = r3.get_row(k, j)
+ *             cube[k, j, :] = np.frombuffer(row, dtype=np.float32)
+ *     r3.close()
+ *     return cube
+ *
+ * refl = read_raster3d("tanager_refl")  # shape [n_bands, nrows, ncols]
+ * print(f"BOA reflectance cube shape: {refl.shape}")
+ * print(f"Mean reflectance at 550 nm: {refl[50].mean():.4f}")
+ * \endcode
+ *
+ * \section pm_python_api Calling libsixsv directly from Python inside GRASS
+ *
+ * The ctypes bindings in `python/atcorr.py` can be imported alongside GRASS
+ * modules.  This lets you compute LUTs and invert reflectance without invoking
+ * the full GRASS module (no Raster3D I/O overhead, convenient for tiling or
+ * for scenes stored as plain files):
+ *
+ * \code{.py}
+ * import sys, os
+ * import numpy as np
+ * import grass.script as gs
+ *
+ * # Make the Python bindings importable
+ * sys.path.insert(0, os.path.expanduser("~/dev/i.hyper.atcorr/python"))
+ * from atcorr import LutConfig, compute_lut, lut_slice, invert, solar_E0
+ *
+ * # ── Step 1: Build the LUT ─────────────────────────────────────────────────
+ * wl  = np.arange(0.376, 2.500, 0.005, dtype=np.float32)
+ * aod = np.array([0.0, 0.05, 0.1, 0.2, 0.4, 0.8], dtype=np.float32)
+ * h2o = np.array([0.5, 1.5, 3.0, 5.0],             dtype=np.float32)
+ *
+ * cfg = LutConfig(wl=wl, aod=aod, h2o=h2o,
+ *                 sza=35.2, vza=4.1, raa=97.0, altitude_km=1000.0,
+ *                 atmo_model=2, aerosol_model=1)   # MIDSUM / continental
+ * lut = compute_lut(cfg)
+ *
+ * # ── Step 2: Read a Raster3D radiance cube from GRASS ──────────────────────
+ * radiance = read_raster3d("tanager_radiance")  # [n_wl, nrows, ncols]
+ * nz, ny, nx = radiance.shape
+ * npix = ny * nx
+ * rho_toa = radiance.reshape(nz, npix)
+ *
+ * # Convert radiance → TOA reflectance
+ * doy  = 160
+ * sza  = 35.2
+ * d2   = earth_sun_dist2(doy)
+ * cosd = np.cos(np.radians(sza))
+ * E0   = solar_E0(wl)                           # [n_wl]
+ * rho_toa = (np.pi * rho_toa * d2
+ *            / (E0[:, None] * cosd)).astype(np.float32)
+ *
+ * # ── Step 3: Invert to BOA ─────────────────────────────────────────────────
+ * sl      = lut_slice(cfg, lut, aod_val=0.15, h2o_val=2.0)
+ * rho_boa = invert(rho_toa,
+ *                  sl.R_atm[:, None],
+ *                  sl.T_down[:, None],
+ *                  sl.T_up[:, None],
+ *                  sl.s_alb[:, None])           # [n_wl, npix]
+ *
+ * # ── Step 4: Write result back as a GRASS Raster3D ─────────────────────────
+ * # (using grass.script.array3d if available, or gs.mapcalc + r3.out.bin)
+ * gs.run_command("r3.in.bin", input="-", output="tanager_refl_py",
+ *                bytes=4, north=gs.region()["n"], ...)
+ * \endcode
+ *
+ * \section pm_jupyter Jupyter notebook workflow
+ *
+ * The recommended Jupyter setup uses the `grass.jupyter` extension available
+ * in GRASS 8.4+:
+ *
+ * \code{.py}
+ * import grass.jupyter as gj
+ * session = gj.init("~/grassdb", "myproject", "PERMANENT")
+ *
+ * # Now all GRASS commands and the atcorr Python bindings are available
+ * import sys
+ * sys.path.insert(0, "~/dev/i.hyper.atcorr/python")
+ * from atcorr import compute_lut, lut_slice, invert, retrieve_dasf
+ * import numpy as np
+ * import matplotlib.pyplot as plt
+ *
+ * # ... build LUT, correct, visualise inline ...
+ * fig, ax = plt.subplots()
+ * ax.plot(wl * 1000, rho_boa[:, 0], label="pixel 0")
+ * ax.set_xlabel("Wavelength (nm)"); ax.set_ylabel("BOA reflectance")
+ * plt.show()
+ * \endcode
+ *
+ * \section pm_no_grass Using libsixsv from Python without GRASS
+ *
+ * All physics functions in `python/atcorr.py` work without a GRASS session.
+ * Only `test_grass_module.py` and the Raster3D I/O helpers require GRASS.
+ *
+ * \code{.sh}
+ * # Set the library path explicitly (no GRASS session needed)
+ * export ATCORR_LIB=$HOME/dev/grass/dist.x86_64-pc-linux-gnu/lib/libgrass_sixsv.8.6.so
+ * python3 - <<'EOF'
+ * import sys; sys.path.insert(0, "python")
+ * from atcorr import solar_E0, compute_lut, LutConfig, mcd43_disaggregate
+ * import numpy as np
+ *
+ * print("E0 at 550 nm:", solar_E0(0.55), "W m⁻² µm⁻¹")
+ *
+ * wl = np.arange(0.40, 2.45, 0.005, dtype=np.float32)
+ * fiso7 = np.array([0.112,0.117,0.095,0.243,0.155,0.118,0.085], np.float32)
+ * fvol7 = np.array([0.045,0.040,0.038,0.131,0.038,0.022,0.014], np.float32)
+ * fgeo7 = np.array([0.017,0.014,0.012,0.052,0.016,0.009,0.006], np.float32)
+ * fiso_wl, _, _ = mcd43_disaggregate(fiso7, fvol7, fgeo7, wl, alpha=0.10)
+ * print("f_iso at 860 nm:", fiso_wl[np.argmin(abs(wl - 0.860))])
+ * EOF
+ * \endcode
+ *
+ * \section pm_batch Batch correction over multiple scenes
+ *
+ * \code{.py}
+ * """batch_correct.py — correct a list of Raster3D cubes sharing one LUT."""
+ *
+ * import grass.script as gs
+ * import sys, os
+ * sys.path.insert(0, os.path.expanduser("~/dev/i.hyper.atcorr/python"))
+ * from atcorr import LutConfig, compute_lut, lut_slice, invert
+ * import numpy as np
+ *
+ * # Geometry common to all scenes (or read from metadata)
+ * SCENES = [
+ *     dict(name="scene_001", doy=120, aod_val=0.12, h2o_val=1.8),
+ *     dict(name="scene_002", doy=155, aod_val=0.20, h2o_val=2.4),
+ *     dict(name="scene_003", doy=200, aod_val=0.08, h2o_val=3.1),
+ * ]
+ *
+ * wl  = np.arange(0.376, 2.500, 0.005, dtype=np.float32)
+ * cfg = LutConfig(wl=wl,
+ *                 aod=np.array([0.0,0.05,0.1,0.2,0.4,0.8], np.float32),
+ *                 h2o=np.array([0.5,1.5,3.0,5.0],           np.float32),
+ *                 sza=32.0, vza=4.0, raa=100.0, altitude_km=1000.0,
+ *                 atmo_model=2, aerosol_model=1)
+ *
+ * # Compute LUT once for the campaign geometry
+ * print("Computing shared LUT …")
+ * lut = compute_lut(cfg)
+ *
+ * for scene in SCENES:
+ *     print(f"Correcting {scene['name']} …")
+ *     radiance = read_raster3d(scene["name"])
+ *     rho_toa  = radiance_to_toa(radiance, wl, scene["doy"], cfg.sza)
+ *     sl       = lut_slice(cfg, lut, scene["aod_val"], scene["h2o_val"])
+ *     rho_boa  = invert(rho_toa, sl.R_atm[:,None],
+ *                       sl.T_down[:,None], sl.T_up[:,None], sl.s_alb[:,None])
+ *     write_raster3d(rho_boa, f"{scene['name']}_refl")
+ *
+ * print("Done.")
+ * \endcode
+ */

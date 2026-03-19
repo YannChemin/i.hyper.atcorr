@@ -217,6 +217,26 @@ class TestFortranCompat(TestCase):
         """ODRAYL: 0.87 µm (NIR), weak Rayleigh scattering."""
         self._assert_odrayl("087", 0.87)
 
+    def test_odrayl_100_swir1(self):
+        """ODRAYL: 1.00 µm (SWIR1) — τ must be very small (<0.01)."""
+        self._assert_odrayl("100", 1.00)
+        self.assertLess(_c_odrayl(1.00), 0.010)
+
+    def test_odrayl_150_swir2(self):
+        """ODRAYL: 1.50 µm (SWIR2) — τ must be negligible (<0.003)."""
+        self._assert_odrayl("150", 1.50)
+        self.assertLess(_c_odrayl(1.50), 0.003)
+
+    def test_odrayl_monotone_decreasing(self):
+        """Rayleigh OD must decrease monotonically with wavelength (τ ∝ λ⁻⁴)."""
+        wls = [0.45, 0.55, 0.65, 0.87, 1.00, 1.50]
+        taus = [_c_odrayl(w) for w in wls]
+        for k in range(len(taus) - 1):
+            self.assertGreater(
+                taus[k], taus[k + 1],
+                msg=f"τ({wls[k]:.2f})={taus[k]:.5f} ≤ τ({wls[k+1]:.2f})={taus[k+1]:.5f}",
+            )
+
     # ── VARSOL vs sixs_earth_sun_dist2 ───────────────────────────────────────
     # Fortran VARSOL returns dsol = 1/d² (solar constant correction, >1 at perihelion).
     # C sixs_earth_sun_dist2 returns d² (<1 at perihelion).
@@ -352,6 +372,41 @@ class TestFortranCompat(TestCase):
         np.testing.assert_allclose(x[1], -x[2], rtol=1e-6)
         np.testing.assert_allclose(w[0],  w[3],  rtol=1e-6)
         np.testing.assert_allclose(w[1],  w[2],  rtol=1e-6)
+
+    def test_gauss_n8_symmetry(self):
+        """GAUSS n=8: nodes and weights are symmetric around 0."""
+        x, w = _c_gauss(-1.0, 1.0, 8)
+        for i in range(4):
+            np.testing.assert_allclose(x[i], -x[7 - i], rtol=1e-6,
+                                       err_msg=f"x[{i}] not symmetric")
+            np.testing.assert_allclose(w[i],  w[7 - i],  rtol=1e-6,
+                                       err_msg=f"w[{i}] not symmetric")
+
+    def test_gauss_n16_weight_sum(self):
+        """Weights of 16-point quadrature on [-1,1] must sum to 2 (DISCOM uses n=16)."""
+        _, w = _c_gauss(-1.0, 1.0, 16)
+        np.testing.assert_allclose(sum(w), 2.0, rtol=1e-5,
+                                   err_msg="GAUSS n=16 weight sum")
+
+    def test_gauss_n16_nodes_vs_fortran(self):
+        """16-point Gauss-Legendre nodes must match Fortran reference values."""
+        x_c, w_c = _c_gauss(-1.0, 1.0, 16)
+        for i in range(16):
+            f_x = self.f[f"gauss_x16_{i+1}"]
+            f_w = self.f[f"gauss_w16_{i+1}"]
+            np.testing.assert_allclose(x_c[i], f_x, rtol=1e-5, atol=1e-9,
+                                       err_msg=f"GAUSS n=16 x[{i+1}]")
+            np.testing.assert_allclose(w_c[i], f_w, rtol=1e-5, atol=1e-9,
+                                       err_msg=f"GAUSS n=16 w[{i+1}]")
+
+    def test_odrayl_lambda4_scaling(self):
+        """Rayleigh OD must satisfy τ(450nm)/τ(870nm) ≈ (870/450)⁴ ≈ 14."""
+        tau_blue = _c_odrayl(0.45)
+        tau_nir  = _c_odrayl(0.87)
+        ratio    = tau_blue / tau_nir
+        expected = (0.87 / 0.45) ** 4
+        np.testing.assert_allclose(ratio, expected, rtol=0.05,
+                                   err_msg=f"λ⁻⁴ ratio: got {ratio:.2f}, expected ~{expected:.2f}")
 
 
 if __name__ == "__main__":

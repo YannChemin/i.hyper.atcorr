@@ -1,0 +1,311 @@
+/**
+ * \page page_libsixsv libsixsv — C and Python API
+ *
+ * \tableofcontents
+ *
+ * **libsixsv** (https://github.com/yannchemin/libsixsv) is a standalone C
+ * shared library that contains the complete 6SV2.1 radiative-transfer engine
+ * together with LUT computation, retrieval algorithms, FlexBRDF, and DASF.
+ * It is the physics back-end for the GRASS add-on *i.hyper.atcorr* and can
+ * equally well be used from any C/C++ program or from Python via ctypes.
+ *
+ * \section lsv_build Building libsixsv
+ *
+ * \code{.sh}
+ * cd ~/dev/libsixsv
+ * make MODULE_TOPDIR=$HOME/dev/grass
+ * # Output: dist.x86_64-pc-linux-gnu/lib/libgrass_sixsv.8.6.so
+ *
+ * # Install to system GRASS (or any prefix):
+ * sudo make install MODULE_TOPDIR=$HOME/dev/grass
+ * \endcode
+ *
+ * \note libsixsv's Makefile hardcodes \c -fopenmp and \c -lgomp regardless of
+ *       whether the GRASS build was configured with `--with-openmp`.  This is
+ *       intentional: GRASS's Platform.make sets \c OPENMP_LIB= empty on hosts
+ *       where GRASS itself was not compiled with OpenMP, but libsixsv needs
+ *       OpenMP for the parallel AOD outer loop.
+ *
+ * \section lsv_c_api C API overview
+ *
+ * Include the relevant header from `~/dev/libsixsv/include/` and link with
+ * `-lgrass_sixsv -lgomp -lm`.
+ *
+ * \subsection lsv_c_lut LUT computation and inversion (atcorr.h)
+ *
+ * The central workflow is: fill a \c LutConfig → call \c atcorr_compute_lut()
+ * → interpolate to a (AOD, H₂O) point → invert TOA reflectance to BOA.
+ *
+ * \code{.c}
+ * #include "atcorr.h"
+ *
+ * // 1. Define the wavelength / AOD / H2O grids
+ * LutConfig cfg = {0};
+ * cfg.n_wl  = 211;
+ * cfg.n_aod = 6;
+ * cfg.n_h2o = 4;
+ * cfg.wl    = ...; // float[211] in µm
+ * cfg.aod   = (float[]){0.0f, 0.05f, 0.1f, 0.2f, 0.4f, 0.8f};
+ * cfg.h2o   = (float[]){0.5f, 1.5f, 3.0f, 5.0f};
+ * cfg.sza   = 35.0f;
+ * cfg.vza   = 4.0f;
+ * cfg.raa   = 97.0f;
+ * cfg.altitude_km  = 1000.0f; // >900 = satellite
+ * cfg.atmo_model   = ATMO_MIDSUM;
+ * cfg.aerosol_type = AEROSOL_CONTINENTAL;
+ *
+ * // 2. Allocate LUT arrays  [n_aod * n_h2o * n_wl] each
+ * size_t sz = cfg.n_aod * cfg.n_h2o * cfg.n_wl;
+ * LutArrays lut = {
+ *     .R_atm  = calloc(sz, sizeof(float)),
+ *     .T_down = calloc(sz, sizeof(float)),
+ *     .T_up   = calloc(sz, sizeof(float)),
+ *     .s_alb  = calloc(sz, sizeof(float)),
+ * };
+ *
+ * // 3. Compute (OpenMP-parallel over AOD)
+ * atcorr_compute_lut(&cfg, &lut);
+ *
+ * // 4. Interpolate to a specific (aod, h2o) point → 1-D slice [n_wl]
+ * float *R_atm_sl = malloc(cfg.n_wl * sizeof(float));
+ * float *T_dn_sl  = malloc(cfg.n_wl * sizeof(float));
+ * float *T_up_sl  = malloc(cfg.n_wl * sizeof(float));
+ * float *s_alb_sl = malloc(cfg.n_wl * sizeof(float));
+ * atcorr_lut_slice(&cfg, &lut, 0.18f, 1.8f,
+ *                  R_atm_sl, T_dn_sl, T_up_sl, s_alb_sl);
+ *
+ * // 5. Invert: rho_boa[b] = f(rho_toa[b], R_atm, T_dn, T_up, s_alb)
+ * for (int b = 0; b < cfg.n_wl; b++)
+ *     rho_boa[b] = atcorr_invert(rho_toa[b],
+ *                                R_atm_sl[b], T_dn_sl[b],
+ *                                T_up_sl[b],  s_alb_sl[b]);
+ * \endcode
+ *
+ * \subsection lsv_c_headers Public header summary
+ *
+ * | Header | Key symbols |
+ * |--------|------------|
+ * | `atcorr.h` | LutConfig, LutArrays, atcorr_compute_lut(), atcorr_lut_slice(), atcorr_invert(), sixs_E0(), sixs_earth_sun_dist2() |
+ * | `brdf.h` | BrdfType, BrdfParams, sixs_brdf_eval(), sixs_brdf_albe() |
+ * | `retrieve.h` | retrieve_h2o_triplet(), retrieve_h2o_consensus(), retrieve_h2o_940(), retrieve_aod_ddv(), retrieve_o3_chappuis(), retrieve_pressure_isa() |
+ * | `spectral_brdf.h` | mcd43_disaggregate(), spectral_smooth_tikhonov(), retrieve_dasf() |
+ * | `terrain.h` | cos_incidence(), skyview_factor(), terrain_correct_tdown() |
+ * | `spatial.h` | gaussian_filter_2d(), box_filter_2d() |
+ * | `adjacency.h` | adjacency_correct_band() |
+ * | `oe_invert.h` | oe_invert_aod_h2o() |
+ * | `surface_model.h` | SurfaceModelImpl, surface_model_map_regularise() |
+ * | `uncertainty.h` | uncertainty_compute_band() |
+ * | `sixs_ctx.h` | SixsCtx, SixsDisc (internal RT context — rarely needed directly) |
+ *
+ * \subsection lsv_c_solar Solar irradiance and Earth–Sun distance
+ *
+ * \code{.c}
+ * #include "atcorr.h"
+ *
+ * float E0   = sixs_E0(0.55f);        // Thuillier TOA irradiance at 550 nm  [W m⁻² µm⁻¹]
+ * float d2   = sixs_earth_sun_dist2(180); // d² at DOY 180  [AU²]
+ * float cosd = cosf(sza_deg * M_PI / 180.0f);
+ *
+ * // Convert radiance to TOA reflectance:
+ * float rho_toa = (float)(M_PI) * L * d2 / (E0 * cosd);
+ * \endcode
+ *
+ * \subsection lsv_c_flexbrdf FlexBRDF (spectral_brdf.h)
+ *
+ * Disaggregate MCD43A1 7-band BRDF kernel weights to a full hyperspectral
+ * sensor grid, with optional Tikhonov second-difference spectral smoothing.
+ *
+ * \code{.c}
+ * #include "spectral_brdf.h"
+ *
+ * const int n_wl = 420;
+ * float wl[420];  // sensor wavelengths in µm, 0.40–2.45
+ * for (int i = 0; i < n_wl; i++) wl[i] = 0.40f + i * 0.005f;
+ *
+ * float fiso_7[7] = {0.112f,0.117f,0.095f,0.243f,0.155f,0.118f,0.085f};
+ * float fvol_7[7] = {0.045f,0.040f,0.038f,0.131f,0.038f,0.022f,0.014f};
+ * float fgeo_7[7] = {0.017f,0.014f,0.012f,0.052f,0.016f,0.009f,0.006f};
+ *
+ * float *fiso_wl = malloc(n_wl * sizeof(float));
+ * float *fvol_wl = malloc(n_wl * sizeof(float));
+ * float *fgeo_wl = malloc(n_wl * sizeof(float));
+ *
+ * // alpha=0.10 Tikhonov regularisation removes piecewise-linear kinks
+ * mcd43_disaggregate(fiso_7, fvol_7, fgeo_7, wl, n_wl, 0.10f,
+ *                    fiso_wl, fvol_wl, fgeo_wl);
+ *
+ * // Smooth any other signal independently (in-place)
+ * spectral_smooth_tikhonov(some_spectrum, n_wl, 0.05f);
+ *
+ * free(fiso_wl); free(fvol_wl); free(fgeo_wl);
+ * \endcode
+ *
+ * \subsection lsv_c_dasf DASF retrieval (spectral_brdf.h)
+ *
+ * \code{.c}
+ * #include "spectral_brdf.h"
+ * #include <math.h>
+ *
+ * int n_dasf = 17;   // bands in 710–790 nm at 5 nm step
+ * int npix   = nrows * ncols;
+ * float *refl_nir = ...;  // [n_dasf × npix], band-major layout
+ * float *wl_nir   = ...;  // wavelengths in µm
+ * float *dasf     = malloc(npix * sizeof(float));
+ *
+ * retrieve_dasf(refl_nir, wl_nir, n_dasf, npix, dasf);
+ * // dasf[i] ∈ [0.01, 1.0], NaN for non-vegetation / bad pixels
+ *
+ * free(dasf);
+ * \endcode
+ *
+ * \subsection lsv_c_compile Compilation example
+ *
+ * \code{.sh}
+ * gcc -O2 -fopenmp example.c \
+ *     -I$HOME/dev/libsixsv/include \
+ *     -L$(GRASS_DIST)/lib -lgrass_sixsv -lm \
+ *     -Wl,-rpath,$(GRASS_DIST)/lib \
+ *     -o example
+ * \endcode
+ *
+ * ---
+ *
+ * \section lsv_python Python API (python/atcorr.py)
+ *
+ * `python/atcorr.py` provides a pure-ctypes wrapper over `libgrass_sixsv.so`.
+ * No compilation step is needed beyond building the library itself.  NumPy is
+ * the only Python dependency.
+ *
+ * \subsection lsv_py_load Loading the library
+ *
+ * By default the bindings locate `libgrass_sixsv.so` through the standard
+ * GRASS library path.  To use it from outside a GRASS session set
+ * `ATCORR_LIB` to the full path:
+ *
+ * \code{.sh}
+ * export ATCORR_LIB=$HOME/dev/grass/dist.x86_64-pc-linux-gnu/lib/libgrass_sixsv.8.6.so
+ * python3 -c "import atcorr; print(atcorr.solar_E0(0.55))"
+ * \endcode
+ *
+ * \subsection lsv_py_lut LUT computation and inversion
+ *
+ * \code{.py}
+ * import numpy as np
+ * import sys; sys.path.insert(0, "python")
+ * from atcorr import LutConfig, compute_lut, lut_slice, invert
+ *
+ * wl  = np.arange(0.376, 2.500, 0.005, dtype=np.float32)  # 425 bands
+ * aod = np.array([0.0, 0.05, 0.1, 0.2, 0.4, 0.8], dtype=np.float32)
+ * h2o = np.array([0.5, 1.5, 3.0, 5.0],             dtype=np.float32)
+ *
+ * cfg = LutConfig(wl=wl, aod=aod, h2o=h2o,
+ *                 sza=35.0, vza=4.0, raa=97.0, altitude_km=1000.0,
+ *                 atmo_model=2,    # MIDSUM
+ *                 aerosol_model=1) # continental
+ * lut = compute_lut(cfg)          # LutArrays, arrays shaped [n_aod, n_h2o, n_wl]
+ *
+ * # Slice to a scalar atmospheric state
+ * sl = lut_slice(cfg, lut, aod_val=0.18, h2o_val=1.8)
+ *
+ * # Invert: rho_toa [n_wl, npix] → rho_boa [n_wl, npix]
+ * rho_boa = invert(rho_toa,
+ *                  sl.R_atm[:, np.newaxis],
+ *                  sl.T_down[:, np.newaxis],
+ *                  sl.T_up[:, np.newaxis],
+ *                  sl.s_alb[:, np.newaxis])
+ * \endcode
+ *
+ * \subsection lsv_py_solar Solar functions
+ *
+ * \code{.py}
+ * from atcorr import solar_E0, earth_sun_dist2
+ *
+ * E0 = solar_E0(0.55)               # float: Thuillier irradiance at 550 nm
+ * E0_arr = solar_E0(np.array([0.45, 0.55, 0.65], dtype=np.float32))  # array
+ *
+ * d2 = earth_sun_dist2(180)         # float: d² at DOY 180 [AU²]
+ * \endcode
+ *
+ * \subsection lsv_py_flexbrdf FlexBRDF from Python
+ *
+ * \code{.py}
+ * from atcorr import mcd43_disaggregate, spectral_smooth_tikhonov
+ * import numpy as np
+ *
+ * wl = np.linspace(0.40, 2.45, 420, dtype=np.float32)
+ *
+ * fiso_7 = np.array([0.112, 0.117, 0.095, 0.243, 0.155, 0.118, 0.085], dtype=np.float32)
+ * fvol_7 = np.array([0.045, 0.040, 0.038, 0.131, 0.038, 0.022, 0.014], dtype=np.float32)
+ * fgeo_7 = np.array([0.017, 0.014, 0.012, 0.052, 0.016, 0.009, 0.006], dtype=np.float32)
+ *
+ * # Disaggregate to sensor grid (Tikhonov alpha=0.10 removes kinks)
+ * fiso_wl, fvol_wl, fgeo_wl = mcd43_disaggregate(fiso_7, fvol_7, fgeo_7, wl, alpha=0.10)
+ *
+ * # Smooth any 1-D spectrum (returns copy; input unchanged)
+ * smoothed = spectral_smooth_tikhonov(some_spectrum, alpha=0.05)
+ * \endcode
+ *
+ * \subsection lsv_py_dasf DASF from Python
+ *
+ * \code{.py}
+ * from atcorr import retrieve_dasf
+ * import numpy as np
+ *
+ * nir_mask = (wl >= 0.710) & (wl <= 0.790)
+ * wl_nir   = wl[nir_mask]
+ * refl_nir = rho_boa[nir_mask, :]        # shape (n_dasf, npix), band-major
+ *
+ * dasf = retrieve_dasf(refl_nir, wl_nir)  # float32 [npix]; NaN for non-veg
+ * \endcode
+ *
+ * \subsection lsv_py_h2o Water vapour retrieval
+ *
+ * \code{.py}
+ * from atcorr import retrieve_h2o_triplet, retrieve_h2o_consensus
+ * import numpy as np
+ *
+ * # Single 940 nm triplet (lo/feat/hi band radiances + geometry)
+ * wvc, valid = retrieve_h2o_triplet(L_lo, L_feat, L_hi,
+ *                                   wl_lo=0.865, wl_feat=0.940, wl_hi=1.040,
+ *                                   K_ref=0.0093, fwhm_ref_um=0.010,
+ *                                   fwhm_um=0.005,
+ *                                   D_min=0.01, D_max=0.99,
+ *                                   sza_deg=35.0, vza_deg=4.0)
+ *
+ * # Consensus from multiple triplet estimates (720/940/1135 nm)
+ * wvc_final = retrieve_h2o_consensus([wvc_720, wvc_940, wvc_1135],
+ *                                    [valid_720, valid_940, valid_1135])
+ * \endcode
+ *
+ * \subsection lsv_py_oe Optimal estimation inversion
+ *
+ * \code{.py}
+ * from atcorr import oe_invert_aod_h2o
+ *
+ * # Joint per-pixel AOD+H2O MAP retrieval
+ * aod_px, h2o_px = oe_invert_aod_h2o(
+ *     rho_toa,           # [n_wl, npix] float32
+ *     cfg, lut,
+ *     prior_aod=0.15, sigma_aod=0.10,
+ *     prior_h2o=2.0,  sigma_h2o=1.0,
+ * )
+ * \endcode
+ *
+ * \subsection lsv_py_api_summary Python API summary
+ *
+ * | Function | Description |
+ * |----------|-------------|
+ * | `compute_lut(cfg)` | Compute full [AOD × H₂O × λ] LUT |
+ * | `lut_slice(cfg, lut, aod_val, h2o_val)` | Trilinear interpolate to scalar (AOD, H₂O) |
+ * | `invert(rho_toa, R_atm, T_down, T_up, s_alb)` | Lambertian BOA inversion |
+ * | `solar_E0(wl)` | Thuillier solar irradiance (scalar or array) |
+ * | `earth_sun_dist2(doy)` | Squared Earth-Sun distance [AU²] |
+ * | `mcd43_disaggregate(fiso7, fvol7, fgeo7, wl, alpha)` | MCD43 → hyperspectral BRDF |
+ * | `spectral_smooth_tikhonov(f, alpha)` | Tikhonov spectral smoother |
+ * | `retrieve_dasf(refl_nir, wl_nir)` | DASF from 710–790 nm NIR plateau |
+ * | `retrieve_h2o_triplet(...)` | H₂O from a single band-depth triplet |
+ * | `retrieve_h2o_consensus(...)` | Median consensus over multiple WVC estimates |
+ * | `retrieve_h2o_940(L_865, L_940, L_1040, ...)` | Legacy single-band H₂O retrieval |
+ * | `oe_invert_aod_h2o(rho_toa, cfg, lut, ...)` | Joint AOD+H₂O MAP inversion |
+ * | `apply_srf_correction(cfg, lut, fwhm_um)` | SRF gas transmittance correction |
+ */

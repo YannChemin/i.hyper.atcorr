@@ -1,0 +1,144 @@
+/**
+ * \page page_history Historical context — from 5S to 6SV
+ *
+ * \tableofcontents
+ *
+ * \section hist_5s 5S — the origin (Université de Lille, 1985)
+ *
+ * The lineage of today's 6SV starts with **5S** (*Simulation du Signal
+ * Satellitaire dans le Spectre Solaire*), developed at the **Laboratoire
+ * d'Optique Atmosphérique (LOA)** of the **Université de Lille I** in the
+ * mid-1980s by Tanré, Herman, Deschamps and colleagues
+ * (Tanré et al., 1986; 1990).
+ *
+ * 5S solved the scalar, plane-parallel radiative-transfer equation for a
+ * Sun–target–sensor geometry using the successive-orders-of-scattering (SOS)
+ * method.  The atmosphere was modelled as a vertically homogeneous mixture of
+ * Rayleigh scatterers and aerosols.  Gas absorption was treated via
+ * pre-computed transmittance tables for H₂O, O₃, O₂ and CO₂.  The code was
+ * written in **Fortran 77** and designed to run on the mainframe computers of
+ * the era.
+ *
+ * 5S was the first publicly available physically complete atmospheric
+ * correction code for visible–SWIR satellite data.  It was widely used for
+ * LANDSAT TM and SPOT-1 corrections throughout the late 1980s.
+ *
+ * \section hist_6s 6S — the international extension (1994–1997)
+ *
+ * In the early 1990s, a collaboration between Lille (Vermote, Tanré, Deuzé,
+ * Herman, Morcrette) and NASA Goddard/USGS (Vermote had moved to the US)
+ * produced a substantially extended successor: **6S** (*Second Simulation
+ * of the Satellite Signal in the Solar Spectrum*).
+ *
+ * Key advances over 5S:
+ * - Six standard atmosphere models (US62, tropical, mid-latitude summer/
+ *   winter, sub-arctic summer/winter)
+ * - Eight aerosol models (continental, maritime, urban, desert, biomass
+ *   burning, stratospheric; plus user-defined mixtures)
+ * - Accurate Lambertian surface BRDF
+ * - Bidirectional effects treated correctly for non-nadir viewing
+ * - Extended wavelength range (0.25–4.0 µm)
+ * - Validated against the MODTRAN code and balloon measurements
+ *
+ * The canonical reference is:
+ * > Vermote, E.F., Tanré, D., Deuzé, J.L., Herman, M. and Morcrette, J.J.
+ * > (1997). Second simulation of the satellite signal in the solar spectrum,
+ * > 6S: An overview. *IEEE Transactions on Geoscience and Remote Sensing*,
+ * > **35**(3), 675–686.
+ *
+ * 6S was adopted as the atmospheric correction engine for the MODIS land
+ * surface reflectance product (MOD09) and later for the Landsat surface
+ * reflectance product, giving it enormous operational reach.
+ *
+ * \section hist_6sv 6SV — the vector era (2006–present)
+ *
+ * Standard 6S only solves the scalar (intensity) radiative-transfer equation.
+ * In 2006, Kotchenova et al. released **6SV** (*6S Vector*), which propagates
+ * the full Stokes vector (I, Q, U) through the atmosphere.  This matters for
+ * the blue/UV bands where Rayleigh scattering can be 100 % polarised at 90°
+ * scattering angles, raising the apparent path reflectance by 4–5 % at 400 nm
+ * compared to the scalar solution.
+ *
+ * > Kotchenova, S.Y., Vermote, E.F., Matarrese, R. and Klemm, F.J. (2006).
+ * > Validation of a vector version of the 6S radiative transfer code for
+ * > atmospheric correction of satellite data. *Applied Optics*,
+ * > **45**(26), 6762–6778.
+ *
+ * 6SV2.1 (the version ported here) adds:
+ * - Polarised ocean surface (Cox–Munk POLGLIT, Nadal–Bréon POLNAD)
+ * - Generalised spherical harmonics (KERNELPOL) for aerosol phase matrices
+ * - Full BRDF surface models in the vector RT path
+ * - Improved gas-absorption parameterisation (reptran method)
+ *
+ * The Fortran 77 source of 6SV2.1 is maintained at
+ * https://www.sod.ias.u-psud.fr/6S/ and forms the reference against which
+ * the C port in **libsixsv** is validated (see \ref page_testsuite for the
+ * 32-test Fortran compatibility suite).
+ *
+ * \section hist_c_port The C port in libsixsv
+ *
+ * Starting in 2024, a complete line-by-line C port of the 6SV2.1 Fortran
+ * core was undertaken as part of the **libsixsv** project
+ * (https://github.com/yannchemin/libsixsv).  The goals were:
+ *
+ * - Enable OpenMP parallelism over the AOD grid for LUT computation
+ *   (Fortran 77 has no OpenMP support in the 6SV2.1 codebase)
+ * - Allow ctypes-based Python bindings without a Fortran compiler dependency
+ * - Serve as the physics backend for the GRASS GIS add-on i.hyper.atcorr
+ *
+ * The port preserves all Fortran COMMON blocks as C structures, all numerical
+ * algorithms identically, and all lookup table constants bitwise-faithfully.
+ * Differences are limited to:
+ * - Off-grid solar spectrum interpolation: C uses linear, Fortran uses
+ *   nearest-neighbour (agreement 0.035 %, well within instrument noise)
+ * - Earth–Sun distance convention: C returns d², Fortran returns 1/d²
+ *   (product ≈ 1.0 within 0.07 %)
+ * - Float32 literal rounding at parse time (0–3 ULP, not a bug)
+ *
+ * \section hist_isofit ISOFIT-inspired extensions
+ *
+ * On top of the 6SV2.1 port, libsixsv implements a set of retrieval and
+ * correction algorithms inspired by the open-source
+ * [ISOFIT](https://github.com/isofit/isofit) framework
+ * (Thompson et al., 2018, 2019):
+ *
+ * - Per-pixel H₂O retrieval from 720/940/1135 nm band depth (FWHM-scaled)
+ * - Per-pixel AOD retrieval from the MODIS Dark Dense Vegetation algorithm
+ * - Scene-mean O₃ from Chappuis absorption (600 nm)
+ * - Per-pixel joint AOD+H₂O MAP inversion (grid-search optimal estimation)
+ * - Vermote 1997 adjacency correction
+ * - 3-component surface prior MAP regularisation (vegetation, soil, water)
+ * - Per-band uncertainty (instrument noise + AOD perturbation)
+ * - FlexBRDF: MCD43A1 → hyperspectral BRDF kernel disaggregation
+ * - DASF: canopy structural scattering factor from 710–790 nm NIR plateau
+ *
+ * \section hist_timeline Timeline
+ *
+ * | Year | Milestone |
+ * |------|-----------|
+ * | 1986 | 5S published (Université de Lille I / LOA) |
+ * | 1994 | 6S development begins (Lille + NASA/USGS collaboration) |
+ * | 1997 | 6S reference paper; adopted for MODIS MOD09 product |
+ * | 2006 | 6SV (vector) published; Kotchenova et al. |
+ * | 2010 | 6SV2.1 released with full BRDF surface models |
+ * | 2018 | ISOFIT published; OE framework for hyperspectral AC |
+ * | 2024 | C port of 6SV2.1 core begun (libsixsv) |
+ * | 2025 | libsixsv v1.0: full Fortran compatibility suite, OpenMP LUT |
+ * | 2026 | i.hyper.atcorr v2.0: 178-test suite, FlexBRDF, DASF, OE inversion |
+ *
+ * \section hist_refs References
+ *
+ * - Tanré, D., Herman, M. and Deschamps, P.Y. (1983). Influence of the
+ *   atmosphere on space measurements of directional properties.
+ *   *Applied Optics*, 22(5), 733–741.
+ * - Tanré, D., Herman, M., Deschamps, P.Y. and De Leffe, A. (1979).
+ *   Atmospheric modeling for space measurements of ground reflectances,
+ *   including bidirectional properties. *Applied Optics*, 18(21), 3587–3594.
+ * - Vermote, E.F., Tanré, D., Deuzé, J.L., Herman, M. and Morcrette, J.J.
+ *   (1997). Second simulation of the satellite signal in the solar spectrum
+ *   (6S). *IEEE Trans. Geosci. Remote Sens.*, 35(3), 675–686.
+ * - Kotchenova, S.Y. et al. (2006). Validation of a vector version of 6S.
+ *   *Applied Optics*, 45(26), 6762–6778.
+ * - Thompson, D.R. et al. (2018). Optimal estimation for imaging spectrometer
+ *   atmospheric correction. *RSE*, 216, 355–373.
+ */

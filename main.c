@@ -37,6 +37,8 @@
  *   R_atm, T_down, T_up, s_alb  float32[n_aod*n_h2o*n_wl] each (C order)
  ****************************************************************************/
 
+#define _POSIX_C_SOURCE 200112L
+
 #include <grass/gis.h>
 #include <grass/glocale.h>
 #include <grass/raster.h>
@@ -49,15 +51,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "include/atcorr.h"
-#include "include/solar_table.h"
-#include "include/spatial.h"
-#include "include/adjacency.h"
-#include "include/surface_model.h"
-#include "include/uncertainty.h"
-#include "include/retrieve.h"
-#include "include/terrain.h"
-#include "include/oe_invert.h"
+#include "atcorr.h"
+#include "solar_table.h"
+#include "spatial.h"
+#include "adjacency.h"
+#include "surface_model.h"
+#include "uncertainty.h"
+#include "retrieve.h"
+#include "terrain.h"
+#include "oe_invert.h"
+#include "spectral_brdf.h"
 
 #define LUT_MAGIC   0x4C555400u
 #define LUT_VERSION 1u
@@ -100,10 +103,33 @@ typedef struct {
 
     /* Pre-computed quality bitmask (RETRIEVE_MASK_*) */
     uint8_t    *quality_data;     /* uint8_t[nrows*ncols] or NULL */
+
+    /* FlexBRDF: spectrally disaggregated MCD43 kernel weights [n_wl] */
+    float      *flex_fiso_wl;     /* float[n_wl] or NULL (= scalar NBAR) */
+    float      *flex_fvol_wl;     /* float[n_wl] or NULL */
+    float      *flex_fgeo_wl;     /* float[n_wl] or NULL */
+    float       flex_fiso_ref;    /* f_iso at NIR reference (858 nm) */
+    float       flex_fvol_ref;    /* f_vol at NIR reference (858 nm) */
+    float       flex_fgeo_ref;    /* f_geo at NIR reference (858 nm) */
+    int         have_flex_brdf;   /* 1 = FlexBRDF disaggregation active */
+
+    /* DASF retrieval output */
+    const char *dasf_output;      /* 2-D raster name, or NULL */
+    int         do_dasf;          /* 1 = accumulate + write DASF */
 } IsoFitParams;
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
+/** \cond INTERNAL */
+
+/**
+ * \brief Parse a comma-separated string of floating-point numbers.
+ *
+ * \param[in]  str    Input string (e.g. \c "0.35,0.55,0.85").
+ * \param[out] out    Output float array; must hold at least \c max_n elements.
+ * \param[in]  max_n  Maximum number of values to parse.
+ * \return Number of values successfully parsed, or -1 on conversion error.
+ */
 static int parse_csv_floats(const char *str, float *out, int max_n)
 {
     char *buf = G_store(str);
@@ -122,15 +148,34 @@ static int parse_csv_floats(const char *str, float *out, int max_n)
     return n;
 }
 
+/** \brief Write an unsigned 32-bit value to a binary file. */
 static void write_u32(FILE *fp, unsigned int v) { fwrite(&v, 4, 1, fp); }
+/** \brief Write a signed 32-bit value to a binary file. */
 static void write_i32(FILE *fp, int v)          { fwrite(&v, 4, 1, fp); }
+/**
+ * \brief Write an array of 32-bit float values to a binary file.
+ * \param[in]  fp  Open file pointer.
+ * \param[in]  v   Source float array.
+ * \param[in]  n   Number of elements to write.
+ */
 static void write_f32a(FILE *fp, const float *v, size_t n)
 {
     fwrite(v, sizeof(float), n, fp);
 }
 
-/* ── Band wavelength parsing from r3.info -h ─────────────────────────────── */
-
+/**
+ * \brief Parse per-band centre wavelengths and FWHM from a Raster3D map's metadata.
+ *
+ * Invokes \c r3.info \c -h to obtain the hyperspectral band metadata written
+ * by write_band_wl_hist() or compatible tools.  Wavelengths are stored in µm.
+ *
+ * \param[in]  mapname  Name of the GRASS Raster3D map.
+ * \param[out] wl       Array of band centre wavelengths (µm); length \c max_n.
+ *                      Entries for unparsed bands are set to -1.
+ * \param[out] fwhm     Array of band FWHM values (µm); may be NULL to skip.
+ * \param[in]  max_n    Maximum number of bands to parse.
+ * \return Number of bands successfully parsed (0 if no metadata found).
+ */
 static int parse_band_wl(const char *mapname, float *wl, float *fwhm, int max_n)
 {
     const char *gisbase = getenv("GISBASE");
@@ -170,8 +215,18 @@ static int parse_band_wl(const char *mapname, float *wl, float *fwhm, int max_n)
     return n;
 }
 
-/* ── Append band wavelength metadata to Raster3D hist file ─────────────────── */
-
+/**
+ * \brief Append per-band wavelength metadata to a Raster3D history file.
+ *
+ * Writes band centre wavelengths and optional FWHM values (in nm) to the
+ * \c hist file of the given Raster3D map so that parse_band_wl() can read
+ * them back in subsequent sessions.
+ *
+ * \param[in]  mapname  Name of the output Raster3D map.
+ * \param[in]  wl       Band centre wavelengths (µm), length \c n.
+ * \param[in]  fwhm     Band FWHM values (µm), length \c n; may be NULL.
+ * \param[in]  n        Number of bands.
+ */
 static void write_band_wl_hist(const char *mapname,
                                 const float *wl, const float *fwhm, int n)
 {
@@ -200,8 +255,17 @@ static void write_band_wl_hist(const char *mapname,
     fclose(f);
 }
 
-/* ── 1-D linear interpolation ───────────────────────────────────────────────── */
-
+/**
+ * \brief 1-D linear interpolation of a LUT array to a target wavelength.
+ *
+ * Clamps to boundary values when \c wl_um is outside the LUT range.
+ *
+ * \param[in]  arr    Source array (length \c n), sampled at \c lut_wl.
+ * \param[in]  lut_wl LUT wavelength axis (µm), strictly increasing, length \c n.
+ * \param[in]  n      Number of LUT points.
+ * \param[in]  wl_um  Target wavelength (µm).
+ * \return Linearly interpolated value.
+ */
 static float interp_wl(const float *arr, const float *lut_wl, int n, float wl_um)
 {
     if (n <= 0)                  return 0.0f;
@@ -213,8 +277,20 @@ static float interp_wl(const float *arr, const float *lut_wl, int n, float wl_um
     return arr[i] * (1.0f - t) + arr[i + 1] * t;
 }
 
-/* ── Load a 2-D GRASS raster into a float array ─────────────────────────────── */
-
+/**
+ * \brief Load a 2-D GRASS raster map into a heap-allocated float array.
+ *
+ * Null cells in the raster are converted to NaN and subsequently replaced by
+ * \c fill_value.  If the map cannot be found a warning is issued and the
+ * entire array is filled with \c fill_value.
+ *
+ * \param[in]  mapname     GRASS raster map name.
+ * \param[in]  nrows       Number of rows in the current region.
+ * \param[in]  ncols       Number of columns in the current region.
+ * \param[in]  fill_value  Value to use for null/missing pixels.
+ * \return G_malloc()'d float array of size \c nrows × \c ncols.
+ *         The caller is responsible for calling G_free().
+ */
 static float *load_raster2d(const char *mapname, int nrows, int ncols,
                              float fill_value)
 {
@@ -258,8 +334,47 @@ static float *load_raster2d(const char *mapname, int nrows, int ncols,
     return data;
 }
 
-/* ── Write a 2-D band into an open Raster3D map ─────────────────────────────── */
+/**
+ * \brief Write a float array to a new 2-D GRASS FCELL raster map.
+ *
+ * Non-finite values (NaN, ±Inf) are written as GRASS null cells.
+ *
+ * \param[in]  mapname  Name of the output raster map to create.
+ * \param[in]  data     Source float array, row-major, size \c nrows × \c ncols.
+ * \param[in]  nrows    Number of rows.
+ * \param[in]  ncols    Number of columns.
+ */
+static void write_raster2d(const char *mapname, const float *data,
+                             int nrows, int ncols)
+{
+    int fd = Rast_open_new(mapname, FCELL_TYPE);
+    FCELL *row_buf = Rast_allocate_f_buf();
+    for (int r = 0; r < nrows; r++) {
+        for (int c = 0; c < ncols; c++) {
+            float v = data[r * ncols + c];
+            if (isfinite(v))
+                row_buf[c] = (FCELL)v;
+            else
+                Rast_set_f_null_value(&row_buf[c], 1);
+        }
+        Rast_put_f_row(fd, row_buf);
+    }
+    G_free(row_buf);
+    Rast_close(fd);
+}
 
+/**
+ * \brief Write a 2-D float band into a depth slice of an open Raster3D map.
+ *
+ * Non-finite values are replaced by \c null_d.
+ *
+ * \param[in,out] outmap   Open GRASS Raster3D map (must be writable).
+ * \param[in]     band     Source float array, row-major, size \c nrows × \c ncols.
+ * \param[in]     nrows    Number of rows.
+ * \param[in]     ncols    Number of columns.
+ * \param[in]     z        Depth index to write into (band index, 0-based).
+ * \param[in]     null_d   Replacement value for non-finite pixels.
+ */
 static void write_band_to_rast3d(RASTER3D_Map *outmap,
                                   const float *band, int nrows, int ncols, int z,
                                   double null_d)
@@ -273,8 +388,14 @@ static void write_band_to_rast3d(RASTER3D_Map *outmap,
     }
 }
 
-/* ── Find band index closest to target wavelength (µm) ─────────────────────── */
-
+/**
+ * \brief Find the band index whose centre wavelength is closest to \c target.
+ *
+ * \param[in]  wl      Array of band centre wavelengths (µm), length \c n.
+ * \param[in]  n       Number of bands.
+ * \param[in]  target  Target wavelength (µm).
+ * \return Zero-based index of the closest band.
+ */
 static int find_closest_band(const float *wl, int n, float target)
 {
     int   best = 0;
@@ -286,11 +407,20 @@ static int find_closest_band(const float *wl, int n, float target)
     return best;
 }
 
-/* ── Load multiple depth slices from an open Raster3D map ──────────────────── *
- * depths[nb]: band depth indices to load.
- * bufs[nb]:   pre-allocated float[nrows*ncols] output buffers.
- * Invalid / null values → NaN. */
-
+/**
+ * \brief Load multiple depth slices from an open Raster3D map.
+ *
+ * Reads \c nb depth slices at the specified depth indices into pre-allocated
+ * output buffers.  Invalid or null voxel values, and non-positive values, are
+ * stored as NaN.
+ *
+ * \param[in]  map     Open GRASS Raster3D map; may be NULL (all NaN).
+ * \param[in]  depths  Array of depth (band) indices to load, length \c nb.
+ * \param[in]  nb      Number of bands to load.
+ * \param[in]  nrows   Number of rows per slice.
+ * \param[in]  ncols   Number of columns per slice.
+ * \param[out] bufs    Array of \c nb pre-allocated float[nrows×ncols] buffers.
+ */
 static void load_bands_from_cube(RASTER3D_Map *map,
                                   const int *depths, int nb,
                                   int nrows, int ncols,
@@ -313,10 +443,47 @@ static void load_bands_from_cube(RASTER3D_Map *map,
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * correct_raster3d — full correction pipeline with ISOFIT improvements
- * ═══════════════════════════════════════════════════════════════════════════ */
+/** \endcond */
 
+/**
+ * \brief Apply the full 6SV2.1 atmospheric correction pipeline to a Raster3D cube.
+ *
+ * Reads the input hyperspectral radiance cube, converts each band from TOA
+ * radiance to bottom-of-atmosphere reflectance using the precomputed LUT, and
+ * writes the result to a new Raster3D map.  Optionally applies all ISOFIT-
+ * inspired extensions controlled by the \c iso parameter structure:
+ *
+ * - **#1** Per-pixel AOD/H₂O maps with optional Gaussian spatial smoothing.
+ * - **#2** Vermote 1999 adjacency effect correction (Lambertian environment model).
+ * - **#3/#5** Surface prior MAP regularisation via surface_model_regularize().
+ * - **#4/#6** Per-band NEdL-based reflectance uncertainty output.
+ *
+ * Band centre wavelengths are read from the map's \c r3.info metadata; if
+ * absent the LUT wavelength grid is used as fallback.  Sub-25 nm FWHM sensors
+ * trigger an automatic reptran fine SRF gas-absorption correction.
+ *
+ * Physics applied per pixel per band:
+ * \f[
+ *   \rho_\text{toa} = \frac{\pi L d^2}{E_0 \cos\theta_s}
+ * \f]
+ * \f[
+ *   \rho_\text{boa} = \frac{\rho_\text{toa} - R_\text{atm}}{T_\downarrow T_\uparrow
+ *                     (1 + s \rho_\text{boa})}
+ * \f]
+ *
+ * \param[in]  input_name   Name of the input GRASS Raster3D radiance map.
+ * \param[in]  output_name  Name of the output GRASS Raster3D reflectance map.
+ * \param[in]  cfg          LUT configuration (grid axes and dimensions).
+ * \param[in]  lut          Precomputed LUT arrays (may be modified in place by
+ *                          SRF correction).
+ * \param[in]  aod_val      Scene-average AOD at 550 nm (used when no per-pixel
+ *                          AOD map is provided).
+ * \param[in]  h2o_val      Scene-average column water vapour (g cm⁻²).
+ * \param[in]  doy          Day of year for Earth-Sun distance and E₀ computation.
+ * \param[in]  sza_deg      Solar zenith angle (degrees).
+ * \param[in]  iso          ISOFIT improvement parameters; may be NULL to disable
+ *                          all extensions.
+ */
 static void correct_raster3d(const char *input_name, const char *output_name,
                               const LutConfig *cfg, LutArrays *lut,
                               float aod_val, float h2o_val,
@@ -373,11 +540,11 @@ static void correct_raster3d(const char *input_name, const char *output_name,
                 if (fn < min_fwhm_nm) min_fwhm_nm = fn;
             }
         }
-        if (n_fwhm > 0 && min_fwhm_nm < 5.0f) {
-            G_message(_("Sub-nm sensor (min FWHM=%.2f nm): "
+        if (n_fwhm > 0 && min_fwhm_nm < 25.0f) {
+            G_message(_("Sensor FWHM=%.2f nm: "
                         "applying reptran fine SRF gas correction..."),
                       min_fwhm_nm);
-            SrfConfig srf_cfg = { .fwhm_um = band_fwhm, .threshold_um = 0.005f };
+            SrfConfig srf_cfg = { .fwhm_um = band_fwhm, .threshold_um = 0.025f };
             SrfCorrection *srf = atcorr_srf_compute(&srf_cfg, cfg);
             if (srf) {
                 atcorr_srf_apply(srf, cfg, lut);
@@ -492,6 +659,38 @@ static void correct_raster3d(const char *input_name, const char *output_name,
         fiso_data = load_raster2d(iso->brdf_fiso_map, nrows, ncols, 1.0f);
         fvol_data = load_raster2d(iso->brdf_fvol_map, nrows, ncols, 0.0f);
         fgeo_data = load_raster2d(iso->brdf_fgeo_map, nrows, ncols, 0.0f);
+    }
+
+    /* ── FlexBRDF: spectral kernel weight scales (band-indexed during loop) ── */
+    int have_flex = (iso && iso->have_flex_brdf
+                     && iso->flex_fiso_wl && iso->flex_fvol_wl && iso->flex_fgeo_wl);
+
+    /* ── DASF accumulators (band-major: [n_dasf_max × npix]) ── *
+     * We accumulate on-the-fly per pixel to avoid a large temporary buffer.
+     * Two float[npix] arrays hold the per-pixel sums; DASF bands are those
+     * within [0.710, 0.790] µm. Red (660 nm) and NIR (870 nm) bands are saved
+     * for NDVI masking of non-vegetation pixels. */
+    int     do_dasf       = (iso && iso->do_dasf && iso->dasf_output);
+    float  *dasf_sum_xy   = NULL;
+    float  *dasf_sum_yy   = NULL;
+    float  *dasf_red_band = NULL;   /* refl at ~660 nm for NDVI */
+    float  *dasf_nir_band = NULL;   /* refl at ~870 nm for NDVI */
+    int     n_dasf_bands  = 0;      /* count of DASF bands accumulated so far */
+    int     dasf_red_z    = -1;     /* band index of closest band to 660 nm */
+    int     dasf_nir_z    = -1;     /* band index of closest band to 870 nm */
+
+    if (do_dasf) {
+        dasf_sum_xy   = G_calloc((size_t)npix, sizeof(float));
+        dasf_sum_yy   = G_calloc((size_t)npix, sizeof(float));
+        dasf_red_band = G_malloc((size_t)npix * sizeof(float));
+        dasf_nir_band = G_malloc((size_t)npix * sizeof(float));
+        for (int i = 0; i < npix; i++) {
+            dasf_red_band[i] = NAN;
+            dasf_nir_band[i] = NAN;
+        }
+        /* Find red / NIR band indices for NDVI masking */
+        dasf_red_z = find_closest_band(band_wl, ndepths, 0.660f);
+        dasf_nir_z = find_closest_band(band_wl, ndepths, 0.870f);
     }
 
     /* ── Pre-compute scalar LUT slice (used when no per-pixel maps) ── */
@@ -615,13 +814,27 @@ static void correct_raster3d(const char *input_name, const char *output_name,
                     (Rast_is_d_null_value(&L) || L <= 0.0) ? NAN : (float)L;
             }
 
+        /* ── FlexBRDF: spectral scale factors at this wavelength ── *
+         * wl_scale_* = f_iso/vol/geo at band z relative to the NIR (858 nm) reference.
+         * When have_flex=0: all scales=1 → identical to non-FlexBRDF path.
+         * When have_flex=1 but have_nbar=0: fiso_wl[z] applied directly as scene mean. */
+        float wl_scale_iso = 1.0f, wl_scale_vol = 1.0f, wl_scale_geo = 1.0f;
+        if (have_flex) {
+            wl_scale_iso = (iso->flex_fiso_ref > 1e-6f)
+                           ? iso->flex_fiso_wl[z] / iso->flex_fiso_ref : 1.0f;
+            wl_scale_vol = (fabsf(iso->flex_fvol_ref) > 1e-6f)
+                           ? iso->flex_fvol_wl[z] / iso->flex_fvol_ref : 1.0f;
+            wl_scale_geo = (fabsf(iso->flex_fgeo_ref) > 1e-6f)
+                           ? iso->flex_fgeo_wl[z] / iso->flex_fgeo_ref : 1.0f;
+        }
+
         /* ── Per-pixel inversion ── */
 
         /* Scalar direct T_d for this band (terrain); cos(vza_ref) for T_up scaling */
         float T_d_dir_s   = Tdds ? interp_wl(Tdds, cfg->wl, n_wl, wl) : T_d_s;
         float cos_vza_ref = cosf(cfg->vza * (float)(M_PI / 180.0));
 
-        if (use_per_pixel || have_terrain || have_nbar) {
+        if (use_per_pixel || have_terrain || have_nbar || have_flex) {
             /* Per-pixel path: AOD/H2O LUT interp + terrain + NBAR */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -682,11 +895,22 @@ static void correct_raster3d(const char *input_name, const char *output_name,
                     ? atcorr_invert_brdf(rho_toa, R_a, T_d, T_u, s_a, rho_albe_brdf)
                     : atcorr_invert(rho_toa, R_a, T_d, T_u, s_a);
 
-                /* NBAR normalization (Ross-Li MCD43 kernels) */
-                if (have_nbar && isfinite(rho_boa)) {
-                    float f_iso = isfinite(fiso_data[i]) ? fiso_data[i] : 1.0f;
-                    float f_vol = isfinite(fvol_data[i]) ? fvol_data[i] : 0.0f;
-                    float f_geo = isfinite(fgeo_data[i]) ? fgeo_data[i] : 0.0f;
+                /* NBAR normalization (Ross-Li MCD43 kernels)
+                 * FlexBRDF: per-pixel amplitude × spectral shape from MCD43 disaggregation.
+                 * wl_scale_* carries the spectral variation relative to the 858 nm reference;
+                 * fiso_data / fvol_data / fgeo_data carry the per-pixel spatial amplitude.
+                 * When have_flex=0: wl_scale_*=1.0 → identical to original NBAR. */
+                if ((have_nbar || have_flex) && isfinite(rho_boa)) {
+                    float f_iso = (have_nbar && fiso_data && isfinite(fiso_data[i]))
+                                  ? fiso_data[i] : (have_flex ? iso->flex_fiso_ref : 1.0f);
+                    float f_vol = (have_nbar && fvol_data && isfinite(fvol_data[i]))
+                                  ? fvol_data[i] : (have_flex ? iso->flex_fvol_ref : 0.0f);
+                    float f_geo = (have_nbar && fgeo_data && isfinite(fgeo_data[i]))
+                                  ? fgeo_data[i] : (have_flex ? iso->flex_fgeo_ref : 0.0f);
+                    /* Apply spectral shape from MCD43 disaggregation */
+                    f_iso *= wl_scale_iso;
+                    f_vol *= wl_scale_vol;
+                    f_geo *= wl_scale_geo;
                     float vza_obs = vza_data
                         ? (isfinite(vza_data[i]) ? vza_data[i] : cfg->vza)
                         : cfg->vza;
@@ -725,6 +949,36 @@ static void correct_raster3d(const char *input_name, const char *output_name,
             if (isfinite(r))
                 refl_band[i] = (r < -0.01f) ? -0.01f
                              : (r >  1.5f)  ?  1.5f : r;
+        }
+
+        /* Gas absorption mask: T_round_trip < 0.10 → correction ill-conditioned.
+         * 0.10 catches the 940nm H2O core (T≈0.06) and 2040nm CO2 (T≈0.07)
+         * in addition to deep 1430nm / 1900nm bands (T≈0.001). */
+        if (T_d_s * T_u_s < 0.10f) {
+            for (int i = 0; i < npix; i++) refl_band[i] = NAN;
+        }
+
+        /* ── DASF accumulation + red/NIR band saving ── */
+        if (do_dasf) {
+            /* Save red (~660 nm) and NIR (~870 nm) bands for NDVI masking */
+            if (z == dasf_red_z)
+                memcpy(dasf_red_band, refl_band, (size_t)npix * sizeof(float));
+            if (z == dasf_nir_z)
+                memcpy(dasf_nir_band, refl_band, (size_t)npix * sizeof(float));
+
+            /* Accumulate DASF sums if this band is within the NIR plateau */
+            if (wl >= 0.710f && wl <= 0.790f) {
+                float omega = leaf_albedo_nir(wl);
+                if (omega > 0.0f) {
+                    for (int i = 0; i < npix; i++) {
+                        if (isfinite(refl_band[i])) {
+                            dasf_sum_xy[i] += refl_band[i] * omega;
+                            dasf_sum_yy[i] += omega * omega;
+                        }
+                    }
+                    n_dasf_bands++;
+                }
+            }
         }
 
         /* ── #2: In-loop adjacency correction ── */
@@ -776,6 +1030,41 @@ static void correct_raster3d(const char *input_name, const char *output_name,
         }
     }
     G_percent(1, 1, 1);
+
+    /* ── DASF finalization and 2-D raster output ── */
+    if (do_dasf) {
+        G_message(_("Computing DASF from %d NIR plateau bands (710–790 nm)..."),
+                  n_dasf_bands);
+
+        float *dasf_out = G_malloc((size_t)npix * sizeof(float));
+        for (int i = 0; i < npix; i++) {
+            if (dasf_sum_yy[i] > 1e-6f) {
+                float d = dasf_sum_xy[i] / dasf_sum_yy[i];
+                dasf_out[i] = (d < 0.01f) ? 0.01f : (d > 1.0f) ? 1.0f : d;
+            } else {
+                dasf_out[i] = NAN;
+            }
+        }
+
+        /* NDVI masking: set DASF=NaN for non-vegetation pixels (NDVI < 0.2) */
+        int n_masked = 0;
+        for (int i = 0; i < npix; i++) {
+            float r = dasf_red_band[i];
+            float n = dasf_nir_band[i];
+            float ndvi = (isfinite(r) && isfinite(n) && (r + n) > 0.01f)
+                         ? (n - r) / (n + r) : -1.0f;
+            if (ndvi < 0.2f) { dasf_out[i] = NAN; n_masked++; }
+        }
+        G_verbose_message(_("DASF: masked %d non-vegetation pixels (NDVI<0.2)"),
+                          n_masked);
+
+        write_raster2d(iso->dasf_output, dasf_out, nrows, ncols);
+        G_message(_("DASF written to <%s>"), iso->dasf_output);
+
+        G_free(dasf_out);
+        G_free(dasf_sum_xy);   G_free(dasf_sum_yy);
+        G_free(dasf_red_band); G_free(dasf_nir_band);
+    }
 
     /* ── #3/#5: Surface prior MAP regularisation ── */
     if (refl_cube && surf_mdl) {
@@ -856,6 +1145,24 @@ static void correct_raster3d(const char *input_name, const char *output_name,
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
+/**
+ * \brief GRASS module entry point for \c i.hyper.atcorr.
+ *
+ * Parses command-line options, optionally builds or loads a 3-D
+ * [AOD × H₂O × λ] LUT, and — if an \c input= / \c output= pair is given —
+ * invokes correct_raster3d() to apply the full ISOFIT-extended 6SV2.1
+ * correction pipeline to a hyperspectral Raster3D radiance cube.
+ *
+ * At least one of \c lut= (write a LUT file) or \c output= (write a corrected
+ * Raster3D map) must be specified.  Image-based retrievals (\c -a, \c -w,
+ * \c -p, \c -m flags), NBAR normalisation, terrain illumination correction,
+ * MAP regularisation (\c -r), per-band uncertainty output (\c -u), and DASF
+ * retrieval are all activated via flags and options parsed here.
+ *
+ * \param[in]  argc  Argument count.
+ * \param[in]  argv  Argument vector.
+ * \return \c EXIT_SUCCESS on success; exits via G_fatal_error() on failure.
+ */
 int main(int argc, char *argv[])
 {
     G_gisinit(argv[0]);
@@ -930,9 +1237,33 @@ int main(int argc, char *argv[])
     struct Option *opt_aerosol = G_define_option();
     opt_aerosol->key = "aerosol"; opt_aerosol->type = TYPE_STRING;
     opt_aerosol->required = NO; opt_aerosol->answer = "continental";
-    opt_aerosol->options = "none,continental,maritime,urban,desert";
-    opt_aerosol->description = _("Aerosol model");
+    opt_aerosol->options = "none,continental,maritime,urban,desert,custom";
+    opt_aerosol->description = _("Aerosol model (use 'custom' with mie_r/mie_sigma/mie_mr/mie_mi)");
     opt_aerosol->guisection = _("Atmosphere");
+
+    struct Option *opt_mie_r = G_define_option();
+    opt_mie_r->key = "mie_r"; opt_mie_r->type = TYPE_DOUBLE;
+    opt_mie_r->required = NO; opt_mie_r->answer = "0.10";
+    opt_mie_r->description = _("Custom Mie: log-normal mode radius [µm] (AERONET fine-mode r_eff~0.10-0.15)");
+    opt_mie_r->guisection = _("Atmosphere");
+
+    struct Option *opt_mie_sigma = G_define_option();
+    opt_mie_sigma->key = "mie_sigma"; opt_mie_sigma->type = TYPE_DOUBLE;
+    opt_mie_sigma->required = NO; opt_mie_sigma->answer = "1.50";
+    opt_mie_sigma->description = _("Custom Mie: geometric standard deviation σ_g (typical 1.4-1.8)");
+    opt_mie_sigma->guisection = _("Atmosphere");
+
+    struct Option *opt_mie_mr = G_define_option();
+    opt_mie_mr->key = "mie_mr"; opt_mie_mr->type = TYPE_DOUBLE;
+    opt_mie_mr->required = NO; opt_mie_mr->answer = "1.45";
+    opt_mie_mr->description = _("Custom Mie: real refractive index at 550 nm (dust~1.55, carbon~1.75, marine~1.38)");
+    opt_mie_mr->guisection = _("Atmosphere");
+
+    struct Option *opt_mie_mi = G_define_option();
+    opt_mie_mi->key = "mie_mi"; opt_mie_mi->type = TYPE_DOUBLE;
+    opt_mie_mi->required = NO; opt_mie_mi->answer = "0.005";
+    opt_mie_mi->description = _("Custom Mie: imaginary refractive index at 550 nm (absorbing 0.01-0.05, scattering <0.005)");
+    opt_mie_mi->guisection = _("Atmosphere");
 
     struct Option *opt_ozone = G_define_option();
     opt_ozone->key = "ozone"; opt_ozone->type = TYPE_DOUBLE;
@@ -978,7 +1309,7 @@ int main(int argc, char *argv[])
 
     struct Option *opt_h2o = G_define_option();
     opt_h2o->key = "h2o"; opt_h2o->type = TYPE_STRING;
-    opt_h2o->required = NO; opt_h2o->answer = "0.5,1.0,2.0,3.5,5.0";
+    opt_h2o->required = NO; opt_h2o->answer = "0.5,1.0,1.5,2.0,3.5,5.0";
     opt_h2o->label = _("Column water vapour grid in g/cm² (comma-separated)");
     opt_h2o->guisection = _("LUT");
 
@@ -1295,6 +1626,75 @@ int main(int argc, char *argv[])
         _("Li-Sparse geometric kernel weight from MODIS MCD43A1.");
     opt_fgeo->guisection = _("BRDF");
 
+    /* ── FlexBRDF: spectral disaggregation of 7-band MCD43 ── */
+    struct Option *opt_mcd43_fiso = G_define_option();
+    opt_mcd43_fiso->key         = "mcd43_fiso";
+    opt_mcd43_fiso->type        = TYPE_STRING;
+    opt_mcd43_fiso->required    = NO;
+    opt_mcd43_fiso->answer      = NULL;
+    opt_mcd43_fiso->label       = _("MCD43 f_iso at 7 MODIS bands (469,555,645,858,1240,1640,2130 nm)");
+    opt_mcd43_fiso->description =
+        _("Seven comma-separated f_iso kernel weights from MCD43A1 "
+          "at the 7 MODIS bands. Used to disaggregate the isotropic kernel "
+          "weight to the full hyperspectral range via piecewise-linear "
+          "interpolation + Tikhonov smoothing (FlexBRDF).");
+    opt_mcd43_fiso->guisection  = _("BRDF");
+
+    struct Option *opt_mcd43_fvol = G_define_option();
+    opt_mcd43_fvol->key         = "mcd43_fvol";
+    opt_mcd43_fvol->type        = TYPE_STRING;
+    opt_mcd43_fvol->required    = NO;
+    opt_mcd43_fvol->answer      = NULL;
+    opt_mcd43_fvol->label       = _("MCD43 f_vol at 7 MODIS bands");
+    opt_mcd43_fvol->description =
+        _("Seven comma-separated f_vol (RossThick volumetric) kernel weights.");
+    opt_mcd43_fvol->guisection  = _("BRDF");
+
+    struct Option *opt_mcd43_fgeo = G_define_option();
+    opt_mcd43_fgeo->key         = "mcd43_fgeo";
+    opt_mcd43_fgeo->type        = TYPE_STRING;
+    opt_mcd43_fgeo->required    = NO;
+    opt_mcd43_fgeo->answer      = NULL;
+    opt_mcd43_fgeo->label       = _("MCD43 f_geo at 7 MODIS bands");
+    opt_mcd43_fgeo->description =
+        _("Seven comma-separated f_geo (LiSparse geometric) kernel weights.");
+    opt_mcd43_fgeo->guisection  = _("BRDF");
+
+    struct Option *opt_mcd43_alpha = G_define_option();
+    opt_mcd43_alpha->key         = "mcd43_alpha";
+    opt_mcd43_alpha->type        = TYPE_DOUBLE;
+    opt_mcd43_alpha->required    = NO;
+    opt_mcd43_alpha->answer      = "0.10";
+    opt_mcd43_alpha->label       = _("Tikhonov smoothing strength for MCD43 disaggregation");
+    opt_mcd43_alpha->description =
+        _("Controls spectral smoothness of the disaggregated kernel weights. "
+          "0.0 = no smoothing (piecewise-linear only); ~0.1 = gentle smoothing "
+          "(recommended). Larger values increase spectral smoothness.");
+    opt_mcd43_alpha->guisection  = _("BRDF");
+
+    /* ── DASF retrieval ── */
+    struct Option *opt_dasf = G_define_standard_option(G_OPT_R_OUTPUT);
+    opt_dasf->key      = "dasf";
+    opt_dasf->required = NO;
+    opt_dasf->label    = _("Output 2-D DASF raster (requires -D flag)");
+    opt_dasf->description =
+        _("Directional Area Scattering Factor: regresses per-pixel corrected BRF "
+          "against PROSPECT-D leaf albedo over 710–790 nm. "
+          "Output range [0.01, 1.0]; NaN for non-vegetation (NDVI < 0.2). "
+          "Knyazikhin et al. (2013) PNAS 110, E185-E192.");
+    opt_dasf->guisection = _("Retrieval");
+
+    struct Flag *flag_D = G_define_flag();
+    flag_D->key = 'D';
+    flag_D->label = _("Retrieve DASF (canopy angular structure) to dasf= raster");
+    flag_D->description =
+        _("Accumulates per-pixel Directional Area Scattering Factor from corrected "
+          "surface reflectance in the 710–790 nm NIR plateau. "
+          "Output is written to the dasf= 2-D raster. "
+          "Requires output= for per-pixel corrected BRF. "
+          "Non-vegetation pixels (NDVI < 0.2) are masked to NaN.");
+    flag_D->guisection = _("Retrieval");
+
     if (G_parser(argc, argv))
         exit(EXIT_FAILURE);
 
@@ -1314,6 +1714,19 @@ int main(int argc, char *argv[])
         G_warning(_("-m flag has no effect without quality= output option"));
     if (opt_quality->answer && !flag_m->answer)
         G_warning(_("quality= output requires -m flag"));
+    if (flag_D->answer && !opt_output->answer)
+        G_fatal_error(_("-D flag requires output= (corrected reflectance needed for DASF)"));
+    if (flag_D->answer && !opt_dasf->answer)
+        G_warning(_("-D flag has no effect without dasf= output option"));
+    if (opt_dasf->answer && !flag_D->answer)
+        G_warning(_("dasf= output requires -D flag"));
+    {   /* FlexBRDF: all three MCD43 spectral options must be provided together */
+        int mcd43_count = (!!opt_mcd43_fiso->answer + !!opt_mcd43_fvol->answer
+                           + !!opt_mcd43_fgeo->answer);
+        if (mcd43_count > 0 && mcd43_count < 3)
+            G_fatal_error(_("mcd43_fiso=, mcd43_fvol=, and mcd43_fgeo= must all be "
+                            "provided for FlexBRDF spectral disaggregation"));
+    }
 
     /* ── Parse scalar parameters ── */
     float sza      = (float)atof(opt_sza->answer);
@@ -1368,7 +1781,15 @@ int main(int argc, char *argv[])
     else if (!strcmp(opt_aerosol->answer, "maritime"))    aerosol_model = AEROSOL_MARITIME;
     else if (!strcmp(opt_aerosol->answer, "urban"))       aerosol_model = AEROSOL_URBAN;
     else if (!strcmp(opt_aerosol->answer, "desert"))      aerosol_model = AEROSOL_DESERT;
+    else if (!strcmp(opt_aerosol->answer, "custom"))      aerosol_model = AEROSOL_CUSTOM;
     else G_fatal_error(_("Unknown aerosol model: %s"), opt_aerosol->answer);
+
+    if (aerosol_model == AEROSOL_CUSTOM) {
+        double mie_r     = atof(opt_mie_r->answer);
+        double mie_sigma = atof(opt_mie_sigma->answer);
+        if (mie_r <= 0.0 || mie_sigma <= 1.0)
+            G_fatal_error(_("aerosol=custom requires mie_r > 0 and mie_sigma > 1.0"));
+    }
 
     /* BRDF type */
     static const struct { const char *name; BrdfType val; } brdf_map[] = {
@@ -1413,6 +1834,40 @@ int main(int argc, char *argv[])
     float *wl_buf = G_malloc(n_wl * sizeof(float));
     for (int i = 0; i < n_wl; i++) wl_buf[i] = wl_min + i * wl_step;
 
+    /* ── FlexBRDF: disaggregate 7-band MCD43 to the LUT wavelength grid ── */
+    float *flex_fiso_wl = NULL, *flex_fvol_wl = NULL, *flex_fgeo_wl = NULL;
+    float  flex_fiso_ref = 1.0f, flex_fvol_ref = 0.0f, flex_fgeo_ref = 0.0f;
+    int    have_flex_brdf = 0;
+
+    if (opt_mcd43_fiso->answer && opt_mcd43_fvol->answer && opt_mcd43_fgeo->answer) {
+        float fiso7[7], fvol7[7], fgeo7[7];
+        int n7;
+        n7 = parse_csv_floats(opt_mcd43_fiso->answer, fiso7, 7);
+        if (n7 != 7) G_fatal_error(_("mcd43_fiso= requires exactly 7 values, got %d"), n7);
+        n7 = parse_csv_floats(opt_mcd43_fvol->answer, fvol7, 7);
+        if (n7 != 7) G_fatal_error(_("mcd43_fvol= requires exactly 7 values, got %d"), n7);
+        n7 = parse_csv_floats(opt_mcd43_fgeo->answer, fgeo7, 7);
+        if (n7 != 7) G_fatal_error(_("mcd43_fgeo= requires exactly 7 values, got %d"), n7);
+
+        float alpha_mcd43 = (float)atof(opt_mcd43_alpha->answer);
+
+        flex_fiso_wl = G_malloc(n_wl * sizeof(float));
+        flex_fvol_wl = G_malloc(n_wl * sizeof(float));
+        flex_fgeo_wl = G_malloc(n_wl * sizeof(float));
+        mcd43_disaggregate(fiso7, fvol7, fgeo7, wl_buf, n_wl, alpha_mcd43,
+                            flex_fiso_wl, flex_fvol_wl, flex_fgeo_wl);
+
+        /* Reference values at 858 nm (MODIS NIR band B2) */
+        int i858 = find_closest_band(wl_buf, n_wl, 0.858f);
+        flex_fiso_ref = (flex_fiso_wl[i858] > 1e-6f) ? flex_fiso_wl[i858] : 1.0f;
+        flex_fvol_ref = flex_fvol_wl[i858];
+        flex_fgeo_ref = flex_fgeo_wl[i858];
+        have_flex_brdf = 1;
+        G_message(_("FlexBRDF: MCD43 disaggregated to %d LUT bands "
+                    "(alpha=%.2f); f_iso_858=%.4f f_vol_858=%.4f f_geo_858=%.4f"),
+                  n_wl, alpha_mcd43, flex_fiso_ref, flex_fvol_ref, flex_fgeo_ref);
+    }
+
     /* ── Build LUT config ── */
     LutConfig cfg = {
         .wl = wl_buf, .n_wl = n_wl,
@@ -1425,6 +1880,14 @@ int main(int argc, char *argv[])
         .brdf_type = brdf_type, .brdf_params = brdf_params,
         .enable_polar = flag_P->answer ? 1 : 0,
     };
+    if (aerosol_model == AEROSOL_CUSTOM) {
+        cfg.mie_r_mode  = (float)atof(opt_mie_r->answer);
+        cfg.mie_sigma_g = (float)atof(opt_mie_sigma->answer);
+        cfg.mie_m_real  = (float)atof(opt_mie_mr->answer);
+        cfg.mie_m_imag  = (float)atof(opt_mie_mi->answer);
+        G_message(_("Custom Mie aerosol: r_mode=%.3f µm  σ_g=%.2f  n_r=%.3f  n_i=%.4f"),
+                  cfg.mie_r_mode, cfg.mie_sigma_g, cfg.mie_m_real, cfg.mie_m_imag);
+    }
 
     /* ── Image-based atmospheric state retrievals ── *
      * Performed before atcorr_compute_lut() so that O3 and surface pressure
@@ -1465,7 +1928,6 @@ int main(int argc, char *argv[])
         float *cube_fwhm  = G_malloc(ret_nbands * sizeof(float));
         int    n_wl_parsed = parse_band_wl(opt_input->answer, cube_wl,
                                             cube_fwhm, ret_nbands);
-        G_free(cube_fwhm);
         if (n_wl_parsed == 0) {
             G_warning(_("No wavelength metadata in <%s>; retrieval may be inaccurate"),
                       opt_input->answer);
@@ -1498,36 +1960,117 @@ int main(int argc, char *argv[])
             cfg.ozone_du = o3_du;
         }
 
-        /* ── H2O per-pixel from 940 nm ── */
+        /* ── H2O per-pixel: multi-band triplet consensus ── */
         if (flag_w->answer) {
+            /* Band indices for three H2O absorption features */
+            int b700  = find_closest_band(cube_wl, ret_nbands, 0.700f);
+            int b720  = find_closest_band(cube_wl, ret_nbands, 0.720f);
+            int b740  = find_closest_band(cube_wl, ret_nbands, 0.740f);
             int b865  = find_closest_band(cube_wl, ret_nbands, 0.865f);
             int b940  = find_closest_band(cube_wl, ret_nbands, 0.940f);
             int b1040 = find_closest_band(cube_wl, ret_nbands, 1.040f);
-            G_message(_("Retrieving H2O from bands %.0f/%.0f/%.0f nm..."),
-                      cube_wl[b865]*1000.0f, cube_wl[b940]*1000.0f,
-                      cube_wl[b1040]*1000.0f);
+            int b1100 = find_closest_band(cube_wl, ret_nbands, 1.100f);
+            int b1135 = find_closest_band(cube_wl, ret_nbands, 1.135f);
+            int b1175 = find_closest_band(cube_wl, ret_nbands, 1.175f);
 
+            G_message(_("Retrieving H2O from triplets %.0f/%.0f/%.0f, "
+                        "%.0f/%.0f/%.0f, %.0f/%.0f/%.0f nm..."),
+                      cube_wl[b700]*1000.0f, cube_wl[b720]*1000.0f, cube_wl[b740]*1000.0f,
+                      cube_wl[b865]*1000.0f, cube_wl[b940]*1000.0f, cube_wl[b1040]*1000.0f,
+                      cube_wl[b1100]*1000.0f, cube_wl[b1135]*1000.0f, cube_wl[b1175]*1000.0f);
+
+            /* Load 9 bands */
+            float *L_700  = G_malloc(ret_npix * sizeof(float));
+            float *L_720  = G_malloc(ret_npix * sizeof(float));
+            float *L_740  = G_malloc(ret_npix * sizeof(float));
             float *L_865  = G_malloc(ret_npix * sizeof(float));
             float *L_940  = G_malloc(ret_npix * sizeof(float));
             float *L_1040 = G_malloc(ret_npix * sizeof(float));
-            int depths_h2o[3]  = {b865, b940, b1040};
-            float *ptrs_h2o[3] = {L_865, L_940, L_1040};
-            load_bands_from_cube(ret_map, depths_h2o, 3,
-                                 ret_nrows, ret_ncols, ptrs_h2o);
+            float *L_1100 = G_malloc(ret_npix * sizeof(float));
+            float *L_1135 = G_malloc(ret_npix * sizeof(float));
+            float *L_1175 = G_malloc(ret_npix * sizeof(float));
+            int   depths9[9]  = {b700, b720, b740, b865, b940, b1040,
+                                  b1100, b1135, b1175};
+            float *ptrs9[9]   = {L_700, L_720, L_740, L_865, L_940, L_1040,
+                                  L_1100, L_1135, L_1175};
+            load_bands_from_cube(ret_map, depths9, 9,
+                                 ret_nrows, ret_ncols, ptrs9);
 
-            retrieved_h2o = G_malloc(ret_npix * sizeof(float));
-            retrieve_h2o_940(L_865, L_940, L_1040,
-                              ret_npix, sza, vza, retrieved_h2o);
+            /* Sensor FWHM at each feature band */
+            float fwhm720  = (n_wl_parsed > 0 && cube_fwhm[b720]  > 0.0f)
+                             ? cube_fwhm[b720]  : 0.0f;
+            float fwhm940  = (n_wl_parsed > 0 && cube_fwhm[b940]  > 0.0f)
+                             ? cube_fwhm[b940]  : 0.0f;
+            float fwhm1135 = (n_wl_parsed > 0 && cube_fwhm[b1135] > 0.0f)
+                             ? cube_fwhm[b1135] : 0.0f;
+
+            /* Per-pixel WVC and validity for each triplet */
+            float   *wvc720  = G_malloc(ret_npix * sizeof(float));
+            float   *wvc940  = G_malloc(ret_npix * sizeof(float));
+            float   *wvc1135 = G_malloc(ret_npix * sizeof(float));
+            uint8_t *val720  = G_malloc(ret_npix * sizeof(uint8_t));
+            uint8_t *val940  = G_malloc(ret_npix * sizeof(uint8_t));
+            uint8_t *val1135 = G_malloc(ret_npix * sizeof(uint8_t));
+
+            /* 720 nm: K_ref=0.0077 cm²/g at fwhm_ref=60nm (Kanpur-calibrated;
+             * gives K_5nm=0.0535 via (60/5)^0.78=6.946), D_min=0.02, D_max=0.60 */
+            retrieve_h2o_triplet(L_700, L_720, L_740,
+                                 0.700f, 0.720f, 0.740f,
+                                 0.0077f, 0.060f, fwhm720,
+                                 0.02f, 0.60f,
+                                 ret_npix, sza, vza, wvc720, val720);
+
+            /* 940 nm: K_ref=0.036, fwhm_ref=50nm, D_min=0.05, D_max=0.90 */
+            retrieve_h2o_triplet(L_865, L_940, L_1040,
+                                 0.865f, 0.940f, 1.040f,
+                                 0.036f, 0.050f, fwhm940,
+                                 0.05f, 0.90f,
+                                 ret_npix, sza, vza, wvc940, val940);
+
+            /* 1135 nm: K_ref=0.0376 cm²/g at fwhm_ref=45nm (Kanpur-calibrated;
+             * gives K_5nm=0.2087 via (45/5)^0.78=5.550), D_min=0.05, D_max=0.85 */
+            retrieve_h2o_triplet(L_1100, L_1135, L_1175,
+                                 1.100f, 1.135f, 1.175f,
+                                 0.0376f, 0.045f, fwhm1135,
+                                 0.05f, 0.85f,
+                                 ret_npix, sza, vza, wvc1135, val1135);
+
+            /* Free the 9 radiance bands */
+            G_free(L_700); G_free(L_720); G_free(L_740);
             G_free(L_865); G_free(L_940); G_free(L_1040);
+            G_free(L_1100); G_free(L_1135); G_free(L_1175);
 
-            /* Update scalar h2o_val with the scene mean */
-            double h2o_sum = 0.0; int h2o_n = 0;
-            for (int i = 0; i < ret_npix; i++)
-                if (isfinite(retrieved_h2o[i])) { h2o_sum += retrieved_h2o[i]; h2o_n++; }
-            if (h2o_n > 0) {
-                h2o_val = (float)(h2o_sum / h2o_n);
-                G_message(_("H2O retrieved: %.2f g/cm² scene mean"), h2o_val);
+            /* Consensus */
+            retrieved_h2o = G_malloc(ret_npix * sizeof(float));
+            float   *wvc_arr[3]  = {wvc720,  wvc940,  wvc1135};
+            uint8_t *val_arr[3]  = {val720,  val940,  val1135};
+            retrieve_h2o_consensus(3, wvc_arr, val_arr, ret_npix, retrieved_h2o);
+
+            /* Scene means per feature and consensus (valid pixels only) */
+            double s720=0, s940=0, s1135=0, scons=0;
+            int n720=0, n940=0, n1135=0, ncons=0;
+            for (int i = 0; i < ret_npix; i++) {
+                if (val720[i])  { s720  += wvc720[i];  n720++;  }
+                if (val940[i])  { s940  += wvc940[i];  n940++;  }
+                if (val1135[i]) { s1135 += wvc1135[i]; n1135++; }
+                /* Count consensus only for pixels where ≥1 band was valid */
+                if (val720[i] || val940[i] || val1135[i]) {
+                    scons += retrieved_h2o[i]; ncons++;
+                }
             }
+            G_free(wvc720); G_free(wvc940); G_free(wvc1135);
+            G_free(val720); G_free(val940); G_free(val1135);
+
+            G_message(_("H2O retrieved:  720nm=%.2f  940nm=%.2f  1135nm=%.2f  "
+                        "consensus=%.2f g/cm² (%.0f%% valid pixels)"),
+                      n720  > 0 ? (float)(s720  / n720)  : -1.0f,
+                      n940  > 0 ? (float)(s940  / n940)  : -1.0f,
+                      n1135 > 0 ? (float)(s1135 / n1135) : -1.0f,
+                      ncons > 0 ? (float)(scons / ncons) : -1.0f,
+                      100.0f * ncons / ret_npix);
+
+            if (ncons > 0)
+                h2o_val = (float)(scons / ncons);
         }
 
         /* ── AOD per-pixel from DDV ── */
@@ -1655,6 +2198,7 @@ int main(int argc, char *argv[])
 
         Rast3d_close(ret_map);
         G_free(cube_wl);
+        G_free(cube_fwhm);
     }
 
     /* ── Surface pressure from DEM ── */
@@ -1742,7 +2286,6 @@ int main(int argc, char *argv[])
         float *oe_fwhm = G_malloc(oe_nbands * sizeof(float));
         int    n_oe_parsed = parse_band_wl(opt_input->answer, oe_wl, oe_fwhm,
                                             oe_nbands);
-        G_free(oe_fwhm);
         if (n_oe_parsed == 0)
             for (int b = 0; b < oe_nbands && b < n_wl; b++)
                 oe_wl[b] = wl_buf[b];
@@ -1761,6 +2304,9 @@ int main(int argc, char *argv[])
         int b865  = find_closest_band(oe_wl, oe_nbands, 0.865f);
         int b940  = find_closest_band(oe_wl, oe_nbands, 0.940f);
         int b1040 = find_closest_band(oe_wl, oe_nbands, 1.040f);
+        float fwhm_oe_940 = (n_oe_parsed > 0 && oe_fwhm[b940] > 0.0f)
+                            ? oe_fwhm[b940] : 0.0f;
+        G_free(oe_fwhm);
 
         G_message(_("OE retrieval: VIS bands %.0f/%.0f/%.0f/%.0f nm; "
                     "H2O bands %.0f/%.0f/%.0f nm..."),
@@ -1814,6 +2360,7 @@ int main(int argc, char *argv[])
                            aod_val, h2o_val,
                            sigma_aod_oe, sigma_h2o_oe,
                            0.01f,  /* sigma_spec = 1% reflectance */
+                           fwhm_oe_940,
                            retrieved_aod, retrieved_h2o);
 
         G_free(rho_toa_vis);
@@ -1877,10 +2424,14 @@ int main(int argc, char *argv[])
                         "(sun_azimuth=%.1f°)"), sun_azimuth);
         if (do_nbar)
             G_message(_("NBAR normalization: ENABLED (Ross-Li MCD43 kernels)"));
+        if (have_flex_brdf)
+            G_message(_("FlexBRDF: ENABLED (MCD43 spectral disaggregation)"));
         if (flag_r->answer)
             G_message(_("Surface prior MAP regularisation: ENABLED"));
         if (flag_u->answer)
             G_message(_("Reflectance uncertainty: ENABLED"));
+        if (flag_D->answer && opt_dasf->answer)
+            G_message(_("DASF retrieval: ENABLED → <%s>"), opt_dasf->answer);
 
         IsoFitParams iso = {
             .aod_map        = opt_aod_map->answer,
@@ -1904,6 +2455,18 @@ int main(int argc, char *argv[])
             .brdf_fgeo_map  = do_nbar ? opt_fgeo->answer : NULL,
             .pressure_data  = retrieved_pressure,
             .quality_data   = retrieved_quality,
+            /* FlexBRDF spectral kernel weights */
+            .flex_fiso_wl   = flex_fiso_wl,
+            .flex_fvol_wl   = flex_fvol_wl,
+            .flex_fgeo_wl   = flex_fgeo_wl,
+            .flex_fiso_ref  = flex_fiso_ref,
+            .flex_fvol_ref  = flex_fvol_ref,
+            .flex_fgeo_ref  = flex_fgeo_ref,
+            .have_flex_brdf = have_flex_brdf,
+            /* DASF retrieval */
+            .dasf_output    = (flag_D->answer && opt_dasf->answer)
+                              ? opt_dasf->answer : NULL,
+            .do_dasf        = (flag_D->answer && opt_dasf->answer) ? 1 : 0,
         };
 
         if (flag_p->answer && retrieved_pressure)
@@ -1946,6 +2509,7 @@ int main(int argc, char *argv[])
     G_free(retrieved_h2o);
     G_free(retrieved_pressure);
     G_free(retrieved_quality);
+    G_free(flex_fiso_wl); G_free(flex_fvol_wl); G_free(flex_fgeo_wl);
     G_free(wl_buf);
     G_free(R_atm); G_free(T_down); G_free(T_up); G_free(s_alb);
     G_free(T_down_dir);
