@@ -408,13 +408,47 @@ static int find_closest_band(const float *wl, int n, float target)
 }
 
 /**
+ * \brief Extract one Z slice from a Raster3D map into a float buffer via
+ *        bulk tile reads.
+ *
+ * Uses Rast3d_get_block(), which takes the fast tile-bulk path
+ * (Rast3d_get_block_nocache) only when the map was opened with
+ * RASTER3D_NO_CACHE (map->useCache == 0).  The caller is responsible for
+ * opening the map with RASTER3D_NO_CACHE and supplying a scratch buffer
+ * \c dcell_tmp of size \c nrows × \c ncols to avoid per-band allocation.
+ *
+ * Rast3d_get_block block layout for nz=1: buf[row * ncols + col].
+ * Null voxels and non-positive values are stored as NaN in \c out.
+ *
+ * \param[in]  map        Open Raster3D map (must use RASTER3D_NO_CACHE).
+ * \param[in]  z          Depth (band) index to extract (0-based).
+ * \param[in]  nrows      Number of rows.
+ * \param[in]  ncols      Number of columns.
+ * \param[in]  dcell_tmp  Caller-allocated DCELL[nrows*ncols] scratch buffer.
+ * \param[out] out        Caller-allocated float[nrows*ncols] output buffer.
+ */
+static void extract_z_slice(RASTER3D_Map *map, int z, int nrows, int ncols,
+                              DCELL *dcell_tmp, float *out)
+{
+    Rast3d_get_block(map, 0, 0, z, ncols, nrows, 1, dcell_tmp, DCELL_TYPE);
+    int npix = nrows * ncols;
+    for (int i = 0; i < npix; i++) {
+        DCELL v = dcell_tmp[i];
+        out[i] = (Rast_is_d_null_value(&v) || v <= 0.0) ? NAN : (float)v;
+    }
+}
+
+/**
  * \brief Load multiple depth slices from an open Raster3D map.
  *
  * Reads \c nb depth slices at the specified depth indices into pre-allocated
  * output buffers.  Invalid or null voxel values, and non-positive values, are
  * stored as NaN.
  *
- * \param[in]  map     Open GRASS Raster3D map; may be NULL (all NaN).
+ * The map must have been opened with RASTER3D_NO_CACHE so that
+ * extract_z_slice() uses the fast tile-bulk read path.
+ *
+ * \param[in]  map     Open GRASS Raster3D map (RASTER3D_NO_CACHE); may be NULL.
  * \param[in]  depths  Array of depth (band) indices to load, length \c nb.
  * \param[in]  nb      Number of bands to load.
  * \param[in]  nrows   Number of rows per slice.
@@ -432,15 +466,10 @@ static void load_bands_from_cube(RASTER3D_Map *map,
             bufs[b][i] = NAN;
     if (!map) return;
 
-    for (int b = 0; b < nb; b++) {
-        int z = depths[b];
-        for (int r = 0; r < nrows; r++)
-            for (int c = 0; c < ncols; c++) {
-                DCELL v = Rast3d_get_double(map, c, r, z);
-                bufs[b][r * ncols + c] =
-                    (Rast_is_d_null_value(&v) || v <= 0.0) ? NAN : (float)v;
-            }
-    }
+    DCELL *dcell_tmp = G_malloc((size_t)npix * sizeof(DCELL));
+    for (int b = 0; b < nb; b++)
+        extract_z_slice(map, depths[b], nrows, ncols, dcell_tmp, bufs[b]);
+    G_free(dcell_tmp);
 }
 
 /** \endcond */
@@ -500,7 +529,7 @@ static void correct_raster3d(const char *input_name, const char *output_name,
 
     RASTER3D_Map *inmap = Rast3d_open_cell_old(
         input_name, in_mapset, &region,
-        RASTER3D_TILE_SAME_AS_FILE, RASTER3D_USE_CACHE_DEFAULT);
+        RASTER3D_TILE_SAME_AS_FILE, RASTER3D_NO_CACHE);
     if (!inmap)
         G_fatal_error(_("Cannot open 3D raster <%s>"), input_name);
 
@@ -509,6 +538,9 @@ static void correct_raster3d(const char *input_name, const char *output_name,
     int ncols   = region.cols;
     int ndepths = region.depths;
     int npix    = nrows * ncols;
+
+    /* Scratch buffer for extract_z_slice(); allocated once, reused per band. */
+    DCELL *dcell_slice = G_malloc((size_t)npix * sizeof(DCELL));
 
     G_verbose_message(_("Input <%s>: %d rows × %d cols × %d bands"),
                       input_name, nrows, ncols, ndepths);
@@ -807,12 +839,7 @@ static void correct_raster3d(const char *input_name, const char *output_name,
         float s_a_s = interp_wl(ss,  cfg->wl, n_wl, wl);
 
         /* ── Load radiance band ── */
-        for (int row = 0; row < nrows; row++)
-            for (int col = 0; col < ncols; col++) {
-                double L = Rast3d_get_double(inmap, col, row, z);
-                rad_band[row * ncols + col] =
-                    (Rast_is_d_null_value(&L) || L <= 0.0) ? NAN : (float)L;
-            }
+        extract_z_slice(inmap, z, nrows, ncols, dcell_slice, rad_band);
 
         /* ── FlexBRDF: spectral scale factors at this wavelength ── *
          * wl_scale_* = f_iso/vol/geo at band z relative to the NIR (858 nm) reference.
@@ -1130,6 +1157,7 @@ static void correct_raster3d(const char *input_name, const char *output_name,
     G_free(slope_data); G_free(aspect_data);
     G_free(vza_data);   G_free(vaa_data);
     G_free(fiso_data);  G_free(fvol_data);  G_free(fgeo_data);
+    G_free(dcell_slice);
     G_free(rad_band);   G_free(refl_band);
     G_free(sigma_band);
     G_free(refl_cube);  G_free(sigma_cube);
@@ -1912,7 +1940,7 @@ int main(int argc, char *argv[])
         Rast3d_get_window(&ret_reg);
         RASTER3D_Map *ret_map = Rast3d_open_cell_old(
             opt_input->answer, ret_mapset, &ret_reg,
-            RASTER3D_TILE_SAME_AS_FILE, RASTER3D_USE_CACHE_DEFAULT);
+            RASTER3D_TILE_SAME_AS_FILE, RASTER3D_NO_CACHE);
         if (!ret_map)
             G_fatal_error(_("Cannot open input cube <%s> for retrieval"),
                           opt_input->answer);
@@ -2272,7 +2300,7 @@ int main(int argc, char *argv[])
         RASTER3D_Region oe_reg; Rast3d_get_window(&oe_reg);
         RASTER3D_Map *oe_map = Rast3d_open_cell_old(
             opt_input->answer, oe_mapset, &oe_reg,
-            RASTER3D_TILE_SAME_AS_FILE, RASTER3D_USE_CACHE_DEFAULT);
+            RASTER3D_TILE_SAME_AS_FILE, RASTER3D_NO_CACHE);
         if (!oe_map)
             G_fatal_error(_("Cannot open input cube <%s> for OE"), opt_input->answer);
         Rast3d_get_region_struct_map(oe_map, &oe_reg);

@@ -1,0 +1,250 @@
+Create Rast3d_extract_z_slice() using Rast3d_get_block() + RASTER3D_NO_CACHE   
+Update i.hyper.atcorr to call Rast3d_extract_z_slice() instead of its loop
+
+
+Prior information and code to solve the issue
+-----------------------------------------------
+
+❯ read the raster3d library code in $HOME/dev/grass/, at this moment, I am trying to work faster to access a single slice or all of the clices of a raster3d file, it   
+is extremely slow when using the default functions to extract a slice to a GRASS raster file, then once it is written, it can be accessed by r.mapcalc, etc. see        
+i.hyper.atcorr, i.hyper.geology, etc in $HOME/dev/ folder. I would like you to propose a function to extract the slice into a memory (RAM?) and make it available to    
+r.mapcalc somehow without changing anything in r.mapcalc module. investigate the possibilities.                                                                         
+
+● Explore(Explore GRASS raster3d library and related modules)
+  ⎿  Done (40 tool uses · 92.2k tokens · 2m 50s)
+  (ctrl+o to expand)
+
+● Let me dig deeper into the VRT mechanism and r.mapcalc's map-opening internals to understand what a "fake" map approach could look like.
+
+● Explore(Deep dive VRT and raster open/read internals)
+  ⎿  Done (25 tool uses · 76.1k tokens · 1m 49s)
+  (ctrl+o to expand)
+
+● Now I have a thorough picture. Let me look at a few more specific things before proposing a solution.
+
+  Searched for 2 patterns, read 6 files (ctrl+o to expand)
+
+● Now I have a full picture. Let me look at one more critical thing - the null value handling across 2D/3D and how Rast3d_get_block_nocache handles the tile → output
+  mapping:
+
+  Read 2 files (ctrl+o to expand)
+
+● Excellent - that confirms null values are identical between 2D and 3D (Rast3d_is_null_value_num literally delegates to Rast_is_f/d_null_value). No conversion needed.
+
+  Now I have everything. Here is the complete analysis and proposal:
+
+  ---
+  Root cause of the slowness
+
+  The current path used everywhere (in map3.c, i.hyper.atcorr, i.hyper.geology) is:
+
+  Rast3d_get_value()/get_double() per voxel
+    → map->resampleFun() per voxel
+      → Rast3d_coord2tile_index() per voxel
+        → Rast3d_get_tile_ptr() per voxel (cache lookup / possibly disk read)
+
+  For a 1000×1000 slice that's 1,000,000 function calls + cache lookups, with individual tile loads mixed in. Even with a good cache this is brutally inefficient.
+
+  ---
+  The fast extraction path that already exists
+
+  Rast3d_get_block() and Rast3d_get_block_nocache() in lib/raster3d/getblock.c do exactly the right thing: they iterate over the tiles that span the requested block and
+   copy each tile's data in bulk. For a single Z-slice (0, 0, z, ncols, nrows, 1):
+
+  - Only tiles in tile layer z / tileZ are touched
+  - Each tile is read exactly once from disk
+  - Data is batch-copied into your output buffer with Rast3d_copy_values()
+
+  Critical detail (getblock.c:106): the tile-optimized path is only taken when map->useCache == 0 (i.e. opened with RASTER3D_NO_CACHE). With any cache mode,
+  Rast3d_get_block() falls back to the slow voxel-by-voxel loop. This is a latent bug/design flaw.
+
+  ---
+  The "in-memory and available to r.mapcalc" problem
+
+  r.mapcalc is a separate process that finds maps via G_find_raster2() scanning the GRASS mapset search path. A GRASS mapset is simply a directory. If that directory
+  lives on /dev/shm (Linux tmpfs), the map is "in RAM" from the OS perspective — writes are memory writes, reads are memory reads, no HDD/SSD involved.
+
+  GRASS has no built-in in-memory map concept, but it doesn't need one: a tmpfs-backed mapset is transparent to r.mapcalc.
+
+
+
+
+
+
+
+
+
+
+  Part 1 — New library function: tile-optimized Z-slice extraction
+
+
+
+  /* lib/raster3d/slice.c */
+  #include <string.h>
+  #include <grass/gis.h>
+  #include <grass/raster.h>
+  #include <grass/raster3d.h>
+
+  /**
+   * Extract one Z-slice from a 3D raster into a standard 2D raster map.
+   *
+   * Uses Rast3d_get_block_nocache() for tile-based bulk reads: each tile
+   * at the target Z level is loaded exactly once, vs. one function call
+   * per voxel with the default per-voxel API.
+   *
+   * The 3D map is opened internally with RASTER3D_NO_CACHE to guarantee
+   * the fast tile-based path in Rast3d_get_block().
+   *
+   * Null values are identical between 3D and 2D raster (both delegate
+   * to Rast_set_f/d_null_value), so no conversion is needed.
+   *
+   * @param name3d   name of source 3D raster
+   * @param mapset3d mapset of source 3D raster ("" = search)
+   * @param z        Z index to extract (0 = bottom)
+   * @param name2d   name for output 2D raster (current mapset)
+   * @return 0 on success, -1 on error
+   */
+  int Rast3d_extract_z_slice(const char *name3d, const char *mapset3d,
+                              int z, const char *name2d)
+  {
+      RASTER3D_Region region;
+      RASTER3D_Map *map;
+      int ncols, nrows;
+      DCELL *slice;
+      int fd, row;
+
+      Rast3d_init_defaults();
+      Rast3d_get_window(&region);
+      ncols = region.cols;
+      nrows = region.rows;
+
+      /* RASTER3D_NO_CACHE is the key: forces Rast3d_get_block()
+       * into the tile-bulk path (Rast3d_get_block_nocache), not
+       * the slow per-voxel cache path. */
+      map = Rast3d_open_cell_old((char *)name3d,
+                                  (char *)(mapset3d && *mapset3d ? mapset3d
+                                           : G_find_raster3d(name3d, "")),
+                                  &region,
+                                  RASTER3D_TILE_SAME_AS_FILE,
+                                  RASTER3D_NO_CACHE);
+      if (!map) {
+          G_warning("Cannot open 3D map <%s>", name3d);
+          return -1;
+      }
+
+      /* One allocation, one call — reads nx*ny tiles exactly once */
+      slice = G_malloc(ncols * nrows * sizeof(DCELL));
+
+      Rast3d_get_block(map, 0, 0, z, ncols, nrows, 1, slice, DCELL_TYPE);
+      /* block layout from Rast3d_get_block_nocache:
+       *   slice[row * ncols + col]   (z-major, but nz=1 so just y*x) */
+
+      fd = Rast_open_new(name2d, DCELL_TYPE);
+      for (row = 0; row < nrows; row++)
+          Rast_put_d_row(fd, slice + row * ncols);
+
+      Rast_close(fd);
+      Rast3d_close(map);
+      G_free(slice);
+      return 0;
+  }
+
+
+
+  int Rast3d_extract_all_slices(const char *name3d, const char *mapset3d,
+                                 const char *prefix)
+  {
+      RASTER3D_Region region;
+      RASTER3D_Map *map;
+      int ncols, nrows, ndepths, z, fd;
+      DCELL *cube;
+      char outname[GNAME_MAX];
+
+      Rast3d_init_defaults();
+      Rast3d_get_window(&region);
+      ncols   = region.cols;
+      nrows   = region.rows;
+      ndepths = region.depths;
+
+      map = Rast3d_open_cell_old((char *)name3d, ..., RASTER3D_NO_CACHE);
+
+      /* Read entire cube: every tile is touched exactly once */
+      cube = G_malloc((size_t)ncols * nrows * ndepths * sizeof(DCELL));
+      Rast3d_get_block(map, 0, 0, 0, ncols, nrows, ndepths, cube, DCELL_TYPE);
+      /* cube layout: cube[z * nrows * ncols + row * ncols + col] */
+
+      for (z = 0; z < ndepths; z++) {
+          snprintf(outname, sizeof(outname), "%s.%d", prefix, z);
+          fd = Rast_open_new(outname, DCELL_TYPE);
+          DCELL *sliceptr = cube + (size_t)z * nrows * ncols;
+          for (int row = 0; row < nrows; row++)
+              Rast_put_d_row(fd, sliceptr + row * ncols);
+          Rast_close(fd);
+      }
+      G_free(cube);
+      Rast3d_close(map);
+      return 0;
+  }
+
+
+If the full cube doesn't fit in RAM, loop over Z one at a time (reads each "Z-level" of tiles once per call, so tiles are re-read nz times total — still far better than per-voxel):
+
+  /* memory-bounded version */
+  for (z = 0; z < ndepths; z++) {
+      Rast3d_get_block(map, 0, 0, z, ncols, nrows, 1, slice_buf, DCELL_TYPE);
+      // write to raster...
+  }
+
+
+  ---
+  Part 2 — In-memory (RAM) mapset via tmpfs
+
+  Linux /dev/shm is a tmpfs — writes go to RAM, reads come from RAM. A GRASS mapset is just a directory. The trick: create the mapset structure in /dev/shm, symlink it
+  into your GRASS location, then add it to the mapset search path.
+
+  #!/bin/bash
+  # setup_ram_mapset.sh — create a RAM-backed GRASS mapset in /dev/shm
+
+  RAM_MAPSET="RAM_SLICES"
+  SHM_DIR="/dev/shm/grass_$(basename $GISDBASE)_${LOCATION_NAME}_${RAM_MAPSET}"
+
+  # Create the mapset structure in /dev/shm
+  mkdir -p "$SHM_DIR"/{cellhd,cell,cell_misc,hist,cats,fcell}
+
+  # Copy the region/WIND file (required for GRASS mapset recognition)
+  cp "$GISDBASE/$LOCATION_NAME/$MAPSET/WIND" "$SHM_DIR/WIND"
+
+  # Symlink into the GRASS location so GRASS can find it by name
+  LINK="$GISDBASE/$LOCATION_NAME/$RAM_MAPSET"
+  if [ ! -L "$LINK" ]; then
+      ln -s "$SHM_DIR" "$LINK"
+  fi
+
+  # Add to the search path for this session
+  g.mapsets mapset="$RAM_MAPSET" operation=add
+
+  echo "RAM mapset ready: $RAM_MAPSET -> $SHM_DIR"
+
+  Then call your extraction function targeting that mapset. Because the mapset is in the GRASS search path, r.mapcalc finds slices normally:
+
+  # r.mapcalc sees mapname from RAM_SLICES as if it were any normal map
+  r.mapcalc "result = band_42 * mask_raster"
+  # or explicitly:
+  r.mapcalc "result = band_42@RAM_SLICES * mask_raster"
+
+  The symlink is transparent — GRASS uses standard open()/read() syscalls which the kernel services from RAM pages since /dev/shm is tmpfs.
+
+  ---
+  Part 3 — Cleanup on exit
+
+  # cleanup_ram_mapset.sh
+  rm -rf /dev/shm/grass_$(basename $GISDBASE)_${LOCATION_NAME}_RAM_SLICES
+  rm -f "$GISDBASE/$LOCATION_NAME/RAM_SLICES"
+  g.mapsets mapset="RAM_SLICES" operation=remove
+
+  Or use a Python atexit handler / C atexit() in your module.
+
+  ---
+
+
+
