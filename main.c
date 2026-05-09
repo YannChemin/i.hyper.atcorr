@@ -39,10 +39,16 @@
 
 #define _POSIX_C_SOURCE 200112L
 
-#include <grass/gis.h>
-#include <grass/glocale.h>
-#include <grass/raster.h>
-#include <grass/raster3d.h>
+/* Use standalone ras3d library when available (outside GRASS GIS).
+ * ras3d.h provides drop-in replacements for all four GRASS headers below. */
+#if defined(HAVE_RAS3D) && !defined(GRASS_VERSION_MAJOR)
+#  include <ras3d/ras3d.h>
+#else
+#  include <grass/gis.h>
+#  include <grass/glocale.h>
+#  include <grass/raster.h>
+#  include <grass/raster3d.h>
+#endif
 
 #include <errno.h>
 #include <math.h>

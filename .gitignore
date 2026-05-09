@@ -1,10 +1,30 @@
+# GRASS Module.make build tree
 build/
 OBJ.*/
 *.o
 *.so
+
+# Standalone Debian binary (DEBIAN_BUILD=1 output)
+i.hyper.atcorr
+
+# LUT files and scratch temporaries
 *.lut
-tests/test_basic
 *.tmp.html
 *.tmp.md
+
+# Test binaries
+tests/test_basic
+testsuite/test_6sv_compat
+
+# Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Generated documentation (regenerate with: doxygen Doxyfile)
+doc/html/
+doc/latex/
+# Doxygen template scratch files
+doc/doxy_header.tex
+doc/doxy_footer.tex
+doc/doxy_style.sty

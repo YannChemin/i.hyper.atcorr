@@ -1,5 +1,7 @@
 # i.hyper.atcorr
 
+> **GitHub**: <https://github.com/yannchemin/i.hyper.atcorr>
+
 GRASS GIS add-on for atmospheric correction of hyperspectral imagery using a
 C port of the 6SV2.1 (Second Simulation of a Satellite Signal in the Solar
 Spectrum) radiative transfer algorithm with OpenMP parallelisation.
@@ -224,37 +226,81 @@ forest; ~ 0.5–0.7 for open shrubland; NaN for bare soil, water, urban.
 
 ## Installation
 
-### Prerequisites
+Two build modes are available. Choose based on whether GRASS GIS is present.
 
-- GRASS GIS 8.x compiled from source (or development headers)
-- GCC with OpenMP support (`-fopenmp`)
-- Set `MODULE_TOPDIR` in `Makefile` to your GRASS source tree
+---
 
-### Build
+### Mode 1 — GRASS GIS module (default `make`)
 
-```sh
-cd i.hyper.atcorr
-make
-```
+**Prerequisites**
 
-Output: `$GRASS_DIST/bin/i.hyper.atcorr`
+- GRASS GIS 8.x source tree (default: `$HOME/dev/grass`)
+- GCC with OpenMP (`-fopenmp`)
 
-The RT physics library (`libgrass_sixsv.so`) is built separately from the
-`libsixsv` sibling repository and must be installed first:
+**Build**
+
+The RT physics library ([libsixsv](https://github.com/yannchemin/libsixsv))
+must be installed first:
 
 ```sh
-# Build and install libgrass_sixsv.so (hardcodes -fopenmp -lgomp)
 cd ~/dev/libsixsv
 make MODULE_TOPDIR=$HOME/dev/grass
 sudo make install MODULE_TOPDIR=$HOME/dev/grass
 ```
 
-### Install to system GRASS
+Then build and install the module:
 
 ```sh
+cd ~/dev/i.hyper.atcorr
+make
 sudo cp dist.*/bin/i.hyper.atcorr        /usr/local/grass85/bin/
 sudo cp dist.*/lib/libgrass_sixsv.8.6.so /usr/local/grass85/lib/
 ```
+
+---
+
+### Mode 2 — Standalone Debian binary (`make DEBIAN_BUILD=1`)
+
+Runs entirely without GRASS GIS.  Reads GeoTIFF and HDF5 cubes directly via
+**[libras3d](https://github.com/yannchemin/libras3d)**.
+
+**Prerequisites** (Debian trixie packages):
+
+```sh
+sudo dpkg -i libras3d_0.1.0-1_amd64.deb \
+              libras3d-dev_0.1.0-1_amd64.deb \
+              libsixsv1_1.0.0-1_amd64.deb \
+              libsixsv-dev_1.0.0-1_amd64.deb
+```
+
+**Build and install**
+
+```sh
+cd ~/dev/i.hyper.atcorr
+make DEBIAN_BUILD=1
+sudo make DEBIAN_BUILD=1 install   # → /usr/local/bin/i.hyper.atcorr
+```
+
+**Run** (no GRASS environment needed):
+
+```sh
+export RAS3D_PATH=/path/to/input/data
+export RAS3D_OUTDIR=/path/to/output
+
+i.hyper.atcorr \
+    input=scene.tiff \
+    output=scene_boa \
+    sza=35.2 doy=221
+```
+
+Key environment variables when running standalone:
+
+| Variable | Purpose |
+|---|---|
+| `RAS3D_PATH` | Directory searched for input cubes by name |
+| `RAS3D_OUTDIR` | Directory for output GeoTIFF files |
+| `RAS3D_HDF5_DATASET` | Override HDF5 dataset path (e.g. for Tanager/Wyvern) |
+| `RAS3D_VERBOSE` | Verbosity level: 0 quiet, 1 normal, 2 verbose |
 
 ---
 
@@ -440,12 +486,19 @@ per-pixel arrays used during the correction step.
 
 ## Architecture
 
-The RT physics live in the **`libsixsv`** sibling repository
-(`~/dev/libsixsv`), compiled into `libgrass_sixsv.so`.  This add-on repo
-contains only the GRASS module interface (`main.c`) and the Python bindings.
+The RT physics live in the **[libsixsv](https://github.com/yannchemin/libsixsv)**
+sibling repository (`~/dev/libsixsv`), compiled into `libgrass_sixsv.so` (GRASS
+mode) or `libsixsv.so` (Debian standalone mode).  This add-on repo contains only
+the GRASS/ras3d module interface (`main.c`) and the Python bindings.
+
+When built with `DEBIAN_BUILD=1`, the four GRASS headers are replaced by a
+single `<ras3d/ras3d.h>` include (detected via `HAVE_RAS3D` guard).  The
+**[libras3d](https://github.com/yannchemin/libras3d)** library provides
+drop-in implementations of `Rast3d_*`, `G_*`, and `Rast_*` symbols backed by
+libtiff/libgeotiff (GeoTIFF) and libhdf5 (HDF5).
 
 ```
-~/dev/libsixsv/                              (sibling repo)
+~/dev/libsixsv/                              (github.com/yannchemin/libsixsv)
 ├── src/
 │   ├── lut.c            OpenMP LUT computation (AOD outer loop)
 │   │                    + atcorr_lut_interp_pixel() trilinear interp
@@ -474,7 +527,7 @@ contains only the GRASS module interface (`main.c`) and the Python bindings.
                          (GRASS Platform.make sets OPENMP_LIB= empty unless
                          GRASS itself was configured with --with-openmp)
 
-~/dev/i.hyper.atcorr/                       (this repo)
+~/dev/i.hyper.atcorr/                       (github.com/yannchemin/i.hyper.atcorr)
 ├── main.c               GRASS module interface, correct_raster3d()
 └── python/
     └── atcorr.py        ctypes bindings (LutConfig, compute_lut, lut_slice,
@@ -724,6 +777,18 @@ grass --tmp-project XY --exec python3 -m pytest testsuite/ -v
   properties through a complete lifecycle. *Remote Sensing of Environment*,
   193, 204–215. (PROSPECT-D leaf albedo)
 
+## Related repositories
+
+| Repository | Relationship | Description |
+|---|---|---|
+| [libsixsv](https://github.com/yannchemin/libsixsv) | **Upstream dependency** | 6SV2.1 RT physics library; provides LUT computation, per-pixel inversion, BRDF models, retrievals |
+| [libras3d](https://github.com/yannchemin/libras3d) | **Upstream dependency — Debian only** | Standalone GRASS raster3d replacement; enables `DEBIAN_BUILD=1` without a GRASS installation |
+
+## License
+
+This is free and unencumbered software released into the public domain.  
+See <https://unlicense.org> for the full text.
+
 ## Authors
 
-i.hyper.smac project.
+i.hyper.smac project / Yann Chemin.

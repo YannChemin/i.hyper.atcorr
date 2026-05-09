@@ -1,5 +1,15 @@
+i.hyper.albedo		DONE
+i.hyper.continuum  	DONE
+i.hyper.rgb             DONE
+i.hyper.specresamp      DONE
+i.hyper.atcorr  	DONE
+i.hyper.geology         DONE
+i.hyper.indices         DONE
+i.hyper.smac		DONE
+
+
 Create Rast3d_extract_z_slice() using Rast3d_get_block() + RASTER3D_NO_CACHE   
-Update i.hyper.atcorr to call Rast3d_extract_z_slice() instead of its loop
+Update i.hyper.geology to call Rast3d_extract_z_slice() instead of its loop
 
 
 Prior information and code to solve the issue
