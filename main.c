@@ -50,6 +50,7 @@
 #  include <grass/raster3d.h>
 #endif
 
+#include <ctype.h>
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
@@ -170,6 +171,137 @@ static void write_f32a(FILE *fp, const float *v, size_t n)
 }
 
 /**
+ * \brief Extract a numeric or boolean JSON array by key from a JSON text buffer.
+ *
+ * Minimal, schema-specific scanner (not a general JSON parser): finds the
+ * first occurrence of the given key and reads the bracketed comma-separated
+ * array of numbers or true/false tokens that follows its ':'. Sufficient for
+ * i.hyper.import's flat hyper.json band-metadata layout; not a substitute
+ * for a real JSON library on arbitrary input.
+ *
+ * \param[in]  json  Full JSON text (NUL-terminated).
+ * \param[in]  key   Key name to search for (without quotes).
+ * \param[out] out   Destination array of doubles (1.0/0.0 for booleans).
+ * \param[in]  max_n Capacity of \c out.
+ * \return Number of elements parsed (0 if key not found or array empty).
+ */
+static int json_extract_array(const char *json, const char *key,
+                               double *out, int max_n)
+{
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return 0;
+    p = strchr(p + strlen(pattern), ':');
+    if (!p) return 0;
+    p = strchr(p, '[');
+    if (!p) return 0;
+    p++;
+
+    int n = 0;
+    while (*p && *p != ']' && n < max_n) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == ']') break;
+        if (strncmp(p, "true", 4) == 0) {
+            out[n++] = 1.0;
+            p += 4;
+        }
+        else if (strncmp(p, "false", 5) == 0) {
+            out[n++] = 0.0;
+            p += 5;
+        }
+        else {
+            char *endp;
+            double v = strtod(p, &endp);
+            if (endp == p) break; /* malformed entry */
+            out[n++] = v;
+            p = endp;
+        }
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == ',') p++;
+    }
+    return n;
+}
+
+/**
+ * \brief Parse per-band centre wavelengths and FWHM from i.hyper.import's
+ *        grid3/<map>/hyper.json sidecar (HyperMetadata JSON schema).
+ *
+ * i.hyper.import stores band-level wavelength/FWHM/validity metadata in this
+ * JSON sidecar rather than in Raster3D history text, so it must be tried
+ * before falling back to parse_band_wl()'s r3.info -h parsing.
+ *
+ * \param[in]  mapname  Name of the GRASS Raster3D map (``name`` or
+ *                      ``name@mapset``).
+ * \param[out] wl       Array of band centre wavelengths (µm); length \c max_n.
+ *                      Entries for unparsed bands are set to -1.
+ * \param[out] fwhm     Array of band FWHM values (µm); may be NULL to skip.
+ * \param[in]  max_n    Maximum number of bands to parse.
+ * \return Number of bands successfully parsed (0 if sidecar not found or
+ *         has no wavelength array).
+ */
+static int parse_band_wl_hyperjson(const char *mapname, float *wl,
+                                    float *fwhm, int max_n)
+{
+    char name[512], mapset[512];
+    const char *at = strchr(mapname, '@');
+    if (at) {
+        size_t nlen = (size_t)(at - mapname);
+        if (nlen >= sizeof(name)) return 0;
+        memcpy(name, mapname, nlen);
+        name[nlen] = '\0';
+        snprintf(mapset, sizeof(mapset), "%s", at + 1);
+    }
+    else {
+        snprintf(name, sizeof(name), "%s", mapname);
+        const char *found = G_find_raster3d(mapname, "");
+        snprintf(mapset, sizeof(mapset), "%s", found ? found : G_mapset());
+    }
+
+    char path[GPATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s/%s/grid3/%s/hyper.json",
+             G_gisdbase(), G_location(), mapset, name);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0) {
+        fclose(f);
+        return 0;
+    }
+
+    char *buf = G_malloc((size_t)fsize + 1);
+    size_t nread = fread(buf, 1, (size_t)fsize, f);
+    fclose(f);
+    buf[nread] = '\0';
+
+    double *wl_nm = G_malloc(sizeof(double) * (size_t)max_n);
+    int n = json_extract_array(buf, "wavelength", wl_nm, max_n);
+    if (n == 0) {
+        G_free(wl_nm);
+        G_free(buf);
+        return 0;
+    }
+
+    double *fwhm_nm = fwhm ? G_malloc(sizeof(double) * (size_t)max_n) : NULL;
+    int n_fwhm = fwhm ? json_extract_array(buf, "fwhm", fwhm_nm, max_n) : 0;
+
+    for (int i = 0; i < max_n; i++) {
+        wl[i] = (i < n) ? (float)(wl_nm[i] * 1e-3) : -1.0f;
+        if (fwhm)
+            fwhm[i] = (i < n_fwhm) ? (float)(fwhm_nm[i] * 1e-3) : 0.0f;
+    }
+
+    G_free(wl_nm);
+    if (fwhm_nm) G_free(fwhm_nm);
+    G_free(buf);
+    return n;
+}
+
+/**
  * \brief Parse per-band centre wavelengths and FWHM from a Raster3D map's metadata.
  *
  * Invokes \c r3.info \c -h to obtain the hyperspectral band metadata written
@@ -184,6 +316,9 @@ static void write_f32a(FILE *fp, const float *v, size_t n)
  */
 static int parse_band_wl(const char *mapname, float *wl, float *fwhm, int max_n)
 {
+    int n_json = parse_band_wl_hyperjson(mapname, wl, fwhm, max_n);
+    if (n_json > 0) return n_json;
+
     const char *gisbase = getenv("GISBASE");
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "%s/bin/r3.info -h map=%s 2>/dev/null",
