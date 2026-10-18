@@ -416,7 +416,7 @@ void retrieve_quality_mask(const float *L_blue, const float *L_red,
      * Snow/ice: NDSI > 0.40 AND TOA_nir > 0.10   (requires L_swir)
      *
      * References:
-     *   Cloud / shadow: Braaten et al. (2015), Remote Sens. 7:15745
+     *   Cloud / shadow: Braaten et al. (2015), Remote Sens. Environ. 169:128
      *   Water:          McFeeters (1996), Int. J. Remote Sens. 17:1425
      *   Snow:           Hall et al. (1995), Remote Sens. Environ. 54:127
      */
